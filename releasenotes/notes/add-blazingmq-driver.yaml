@@ -1,0 +1,18 @@
+---
+features:
+  - |
+    Added a new BlazingMQ driver for oslo.messaging. BlazingMQ is a
+    high-performance, open-source message queue system that provides
+    durable, fault-tolerant queues with priority and broadcast delivery
+    modes. The driver can be used by setting the transport URL to
+    ``bmq://host:port/domain``, for example
+    ``bmq://localhost:30114/bmq.openstack.priority``.
+    The BlazingMQ Python SDK (``blazingmq``) is required as an optional
+    dependency.
+security:
+  - |
+    The BlazingMQ driver does not support authentication. While the
+    BlazingMQ broker has a built-in authentication framework, the
+    Python SDK does not expose it yet. Access to the BlazingMQ broker
+    should be restricted using network-level controls such as Kubernetes
+    NetworkPolicies or firewall rules.
