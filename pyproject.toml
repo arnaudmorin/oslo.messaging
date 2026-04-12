@@ -46,6 +46,9 @@ tracing-grpc = [
     "opentelemetry-sdk>=1.0.0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.0.0",
 ]
+bmq = [
+    "blazingmq",
+]
 
 [project.scripts]
 oslo-messaging-send-notification = "oslo_messaging.notify.notifier:_send_notification"
@@ -55,6 +58,7 @@ rabbit = "oslo_messaging._drivers.impl_rabbit:RabbitDriver"
 kafka = "oslo_messaging._drivers.impl_kafka:KafkaDriver"
 kombu = "oslo_messaging._drivers.impl_rabbit:RabbitDriver"
 fake = "oslo_messaging._drivers.impl_fake:FakeDriver"
+bmq = "oslo_messaging._drivers.impl_bmq:BmqDriver"
 
 [project.entry-points."oslo.messaging.executors"]
 eventlet = "futurist:GreenThreadPoolExecutor"
