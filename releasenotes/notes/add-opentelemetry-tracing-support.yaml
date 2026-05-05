@@ -1,0 +1,22 @@
+---
+features:
+  - |
+    Added OpenTelemetry distributed tracing support for RPC calls. When
+    enabled, producer spans are created for call() and cast() on the client
+    side, and consumer spans are created on the server side during message
+    dispatch. Trace context is propagated across services via the W3C
+    traceparent header carried inside the message context, allowing full
+    end-to-end trace correlation from HTTP request through RabbitMQ to the
+    RPC backend. The feature is disabled by default and can be enabled with::
+
+      [oslo_messaging_tracing]
+      tracing_enabled = true
+      tracing_service_name = nova
+      otel_exporter_otlp_endpoint = http://localhost:4318
+      otlp_protocol = http/protobuf
+
+    The OTLP transport protocol can be set to ``http/protobuf`` (default)
+    or ``grpc``. The corresponding exporter package must be installed::
+
+      pip install oslo.messaging[tracing-http]   # for HTTP/protobuf
+      pip install oslo.messaging[tracing-grpc]   # for gRPC

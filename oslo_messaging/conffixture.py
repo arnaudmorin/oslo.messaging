@@ -64,6 +64,10 @@ class ConfFixture(fixtures.Fixture):
                      'oslo_messaging._metrics.client',
                      'oslo_messaging_metrics',
                      'oslo_messaging_metrics')
+        _import_opts(self.conf,
+                     'oslo_messaging._tracing.client',
+                     'oslo_messaging_tracing',
+                     'oslo_messaging_tracing')
 
         if transport_url is not None:
             self.transport_url = transport_url
