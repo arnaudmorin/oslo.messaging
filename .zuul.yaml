@@ -1,15 +1,15 @@
 - job:
-    name: oslo.messaging-tox-py310-func-scenario01
-    parent: openstack-tox-py310
+    name: oslo.messaging-tox-py311-func-scenario01
+    parent: openstack-tox-py311
     vars:
-      tox_envlist: py310-func-scenario01
+      tox_envlist: py311-func-scenario01
       bindep_profile: rabbit
 
 - job:
-    name: oslo.messaging-tox-py310-func-scenario02
-    parent: openstack-tox-py310
+    name: oslo.messaging-tox-py311-func-scenario02
+    parent: openstack-tox-py311
     vars:
-      tox_envlist: py310-func-scenario02
+      tox_envlist: py311-func-scenario02
       bindep_profile: rabbit kafka
 
 # Begin v3 native jobs
@@ -88,8 +88,8 @@
       - release-notes-jobs-python3
     check:
       jobs:
-        - oslo.messaging-tox-py310-func-scenario01
-        - oslo.messaging-tox-py310-func-scenario02:
+        - oslo.messaging-tox-py311-func-scenario01
+        - oslo.messaging-tox-py311-func-scenario02:
             voting: false
         - oslo.messaging-src-dsvm-full-rabbit
         - oslo.messaging-src-dsvm-full-kafka-hybrid:
@@ -100,5 +100,5 @@
             voting: false
     gate:
       jobs:
-        - oslo.messaging-tox-py310-func-scenario01
+        - oslo.messaging-tox-py311-func-scenario01
         - oslo.messaging-src-dsvm-full-rabbit
