@@ -1,0 +1,7 @@
+---
+upgrade:
+  - |
+    The RabbitMQ driver now enforces verification of the broker hostnames when
+    ``ssl_ca_file`` is set and ``transport_url`` contanims muleiple RabbitMQ
+    servers. The ``[oslo_messaging_rabbit] oslo_messaging_rabbit`` has no
+    effect now.
