@@ -128,7 +128,6 @@ class MessageStatsCollector:
         threading.Timer(diff, self.monitor).start()  # schedule in a second
 
     def monitor(self):
-        global IS_RUNNING
         if IS_RUNNING:
             # NOTE(kbespalov): this way not properly works
             # because the monitor starting with range 1sec +-150 ms
