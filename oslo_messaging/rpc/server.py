@@ -126,6 +126,7 @@ import sys
 import time
 
 import debtcollector
+from oslo_messaging import _tracing as tracing
 from oslo_messaging import exceptions
 from oslo_messaging.rpc import dispatcher as rpc_dispatcher
 from oslo_messaging import server as msg_server
@@ -169,54 +170,58 @@ class RPCServer(msg_server.MessageHandlingServer):
             LOG.exception("Can not acknowledge message. Skip processing")
             return
 
-        failure = None
-        try:
-            res = self.dispatcher.dispatch(message)
-        except rpc_dispatcher.ExpectedException as e:
-            # current sys.exc_info() content can be overridden
-            # by another exception raised by a log handler during
-            # LOG.debug(). So keep a copy and delete it later.
-            failure = e.exc_info
-            LOG.debug('Expected exception during message handling (%s)', e)
-        except rpc_dispatcher.NoSuchMethod as e:
-            failure = sys.exc_info()
-            if e.method.endswith('_ignore_errors'):
-                LOG.debug('Method %s not found', e.method)
-            else:
+        with tracing.trace_receive(self.conf, message):
+            failure = None
+            try:
+                res = self.dispatcher.dispatch(message)
+            except rpc_dispatcher.ExpectedException as e:
+                # current sys.exc_info() content can be overridden
+                # by another exception raised by a log handler during
+                # LOG.debug(). So keep a copy and delete it later.
+                failure = e.exc_info
+                LOG.debug('Expected exception during message handling (%s)',
+                          e)
+            except rpc_dispatcher.NoSuchMethod as e:
+                failure = sys.exc_info()
+                if e.method.endswith('_ignore_errors'):
+                    LOG.debug('Method %s not found', e.method)
+                else:
+                    LOG.exception('Exception during message handling')
+            except Exception:
+                failure = sys.exc_info()
                 LOG.exception('Exception during message handling')
-        except Exception:
-            failure = sys.exc_info()
-            LOG.exception('Exception during message handling')
 
-        try:
-            if failure is None:
-                message.reply(res)
-                LOG.debug("Replied success message with id %(msg_id)s and "
-                          "method: %(method)s. Time elapsed: %(elapsed).3f",
-                          {"msg_id": message.msg_id,
-                           "method": rpc_method,
-                           "elapsed": (time.time() - start)})
-            else:
-                message.reply(failure=failure)
-                LOG.debug("Replied failure for incoming message with "
-                          "id %(msg_id)s and method: %(method)s. "
-                          "Time elapsed: %(elapsed).3f",
-                          {"msg_id": message.msg_id,
-                           "method": rpc_method,
-                           "elapsed": (time.time() - start)})
-        except exceptions.MessageUndeliverable as e:
-            LOG.exception(
-                "MessageUndeliverable error, "
-                "source exception: %s, routing_key: %s, exchange: %s: ",
-                e.exception, e.routing_key, e.exchange
-            )
-        except Exception:
-            LOG.exception("Can not send reply for message")
-        finally:
-            # NOTE(dhellmann): Remove circular object reference
-            # between the current stack frame and the traceback in
-            # exc_info.
-            del failure
+            try:
+                if failure is None:
+                    message.reply(res)
+                    LOG.debug(
+                        "Replied success message with id %(msg_id)s and "
+                        "method: %(method)s. Time elapsed: %(elapsed).3f",
+                        {"msg_id": message.msg_id,
+                         "method": rpc_method,
+                         "elapsed": (time.time() - start)})
+                else:
+                    message.reply(failure=failure)
+                    LOG.debug(
+                        "Replied failure for incoming message with "
+                        "id %(msg_id)s and method: %(method)s. "
+                        "Time elapsed: %(elapsed).3f",
+                        {"msg_id": message.msg_id,
+                         "method": rpc_method,
+                         "elapsed": (time.time() - start)})
+            except exceptions.MessageUndeliverable as e:
+                LOG.exception(
+                    "MessageUndeliverable error, "
+                    "source exception: %s, routing_key: %s, exchange: %s: ",
+                    e.exception, e.routing_key, e.exchange
+                )
+            except Exception:
+                LOG.exception("Can not send reply for message")
+            finally:
+                # NOTE(dhellmann): Remove circular object reference
+                # between the current stack frame and the traceback in
+                # exc_info.
+                del failure
 
 
 @debtcollector.removals.removed_kwarg(

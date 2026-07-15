@@ -22,6 +22,7 @@ from oslo_config import cfg
 
 from oslo_messaging._drivers import base as driver_base
 from oslo_messaging import _metrics as metrics
+from oslo_messaging import _tracing as tracing
 from oslo_messaging import _utils as utils
 from oslo_messaging import exceptions
 from oslo_messaging import serializer as msg_serializer
@@ -148,12 +149,19 @@ class _BaseCallContext(metaclass=abc.ABCMeta):
 
         self._check_version_cap(msg.get('version'))
 
-        with metrics.measure_metrics(self.conf, target=self.target,
-                                     method=method, call_type="cast"):
+        with tracing.trace_send(
+            self.conf, target=self.target,
+            method=method, call_type="cast",
+            msg_ctxt=msg_ctxt,
+        ), metrics.measure_metrics(
+            self.conf, target=self.target,
+            method=method, call_type="cast",
+        ):
             try:
-                self.transport._send(self.target, msg_ctxt, msg,
-                                     retry=self.retry,
-                                     transport_options=self.transport_options)
+                self.transport._send(
+                    self.target, msg_ctxt, msg,
+                    retry=self.retry,
+                    transport_options=self.transport_options)
             except driver_base.TransportDriverError as ex:
                 raise ClientSendError(self.target, ex)
 
@@ -174,17 +182,27 @@ class _BaseCallContext(metaclass=abc.ABCMeta):
 
         self._check_version_cap(msg.get('version'))
 
-        with metrics.measure_metrics(self.conf, target=self.target,
-                                     method=method, call_type="call"):
+        with tracing.trace_send(
+            self.conf, target=self.target,
+            method=method, call_type="call",
+            msg_ctxt=msg_ctxt,
+        ), metrics.measure_metrics(
+            self.conf, target=self.target,
+            method=method, call_type="call",
+        ):
             try:
                 result = self.transport._send(
-                    self.target, msg_ctxt, msg, wait_for_reply=True,
-                    timeout=timeout, call_monitor_timeout=cm_timeout,
-                    retry=self.retry, transport_options=self.transport_options)
+                    self.target, msg_ctxt, msg,
+                    wait_for_reply=True,
+                    timeout=timeout,
+                    call_monitor_timeout=cm_timeout,
+                    retry=self.retry,
+                    transport_options=self.transport_options)
             except driver_base.TransportDriverError as ex:
                 raise ClientSendError(self.target, ex)
 
-            return self.serializer.deserialize_entity(ctxt, result)
+            return self.serializer.deserialize_entity(
+                ctxt, result)
 
     @abc.abstractmethod
     def prepare(self, exchange=_marker, topic=_marker, namespace=_marker,
