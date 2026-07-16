@@ -79,38 +79,74 @@ class QManager:
         with open(f'/proc/{proc_id}/stat') as f:
             self.start_time = int(f.read().split()[21])
 
+    def _service_identity(self):
+        # The identity of the current *generation* of the service (the master
+        # and all its workers), used to decide whether the shared counter must
+        # be reset (the service restarted) or incremented.
+        #
+        # It MUST be evaluated when the queue name is built, NOT only cached
+        # at __init__ time. With a non-eventlet (threading) backend the
+        # service is supervised by cotyledon, whose master process calls
+        # os.setsid() *after* oslo.messaging objects may already have been
+        # instantiated (e.g. the default transport created before the service
+        # starts serving). A QManager built in the master before setsid
+        # captures the *pre-setsid* process group (the container init group),
+        # while the workers that actually call get() run *after* setsid in the
+        # master's own group. As every QManager of the process (reply queue,
+        # per-cell transports, per-connection fanout queues) shares the same
+        # /dev/shm counter, mixing a master-born identity with a worker-born
+        # one makes them reset the counter for one another: several processes
+        # then build the same reply queue name (reply_<host>:<proc>:1) and
+        # steal each other's RPC replies.
+        # See https://bugs.launchpad.net/oslo.messaging/+bug/2110957
+        pg = os.getpgrp()
+        if not pg:
+            # Process group id 0 (crun edge case, see __init__): keep the
+            # identity captured at construction, as before.
+            return self.pg, self.start_time
+
+        # Disambiguate a recycled pid across a restart with the start time (in
+        # jiffies since system boot) of that process.
+        with open(f'/proc/{pg}/stat') as f:
+            start_time = int(f.read().split()[21])
+        return pg, start_time
+
     def get(self):
         lock_name = 'oslo_read_shm_{}_{}'.format(
             self.hostname, self.processname)
 
         @lockutils.synchronized(lock_name, external=True)
         def read_from_shm():
-            # Grab the counter from shm
+            # Identity of the process actually building the queue name, always
+            # evaluated now (see _service_identity for why it is not cached).
+            pg, start_time = self._service_identity()
+
+            # Grab the counter from shm.
             # This function is thread and process safe thanks to lockutils
             try:
                 with open(self.file_name) as f:
-                    pg, counter, start_time = f.readline().split(':')
-                    pg = int(pg)
+                    stored_pg, counter, stored_start_time = (
+                        f.readline().split(':'))
+                    stored_pg = int(stored_pg)
                     counter = int(counter)
-                    start_time = int(start_time)
+                    stored_start_time = int(stored_start_time)
             except (FileNotFoundError, ValueError):
-                pg = self.pg
+                stored_pg = pg
                 counter = 0
-                start_time = self.start_time
+                stored_start_time = start_time
 
             # Increment the counter
-            if pg == self.pg and start_time == self.start_time:
+            if stored_pg == pg and stored_start_time == start_time:
                 counter += 1
             else:
-                # The process group is changed, or start time since system boot
-                # differs. Maybe service restarted ?
-                # Start over the counter
+                # The process group changed, or the start time since system
+                # boot differs: the service has been restarted, start the
+                # counter over so the queue names get reused.
                 counter = 1
 
             # Write the new counter
             with open(self.file_name, 'w') as f:
-                f.write(str(self.pg) + ':' + str(counter) + ':' +
-                        str(self.start_time))
+                f.write(f'{pg}:{counter}:{start_time}')
             return counter
 
         counter = read_from_shm()
