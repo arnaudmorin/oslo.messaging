@@ -304,10 +304,13 @@ class TestBmqIncomingMessage(BmqTestBase):
             reply_q='bmq://d/reply.abc',
             msg_id='msg-2', post=post_fn)
 
-        msg.reply(failure=(ValueError, ValueError('bad')))
+        msg.reply(failure=(ValueError, ValueError('bad'), None))
 
         body = jsonutils.loads(post_fn.call_args[0][1])
-        self.assertEqual(['ValueError', 'bad'], body['_failure'])
+        failure = jsonutils.loads(body['_failure'])
+        self.assertEqual('ValueError', failure['class'])
+        self.assertEqual('builtins', failure['module'])
+        self.assertEqual('bad', failure['message'])
 
     def test_reply_no_reply_q_is_noop(self):
         post_fn = mock.Mock()
@@ -358,6 +361,56 @@ class TestSendCast(BmqTestBase):
 
         uri = driver._get_session().posted[0][0]
         self.assertEqual('bmq://bmq.test.broadcast/compute', uri)
+
+
+class TestSendCall(BmqTestBase):
+    def _call(self, failure_info, allowed_remote_exmods=None):
+        driver = self._get_driver()
+        driver._allowed_remote_exmods = allowed_remote_exmods or []
+        session = driver._get_session()
+        orig_post = session.post
+
+        # Reply with the failure as soon as the call is posted
+        def post(uri, payload, on_ack=None, **kw):
+            orig_post(uri, payload, on_ack=on_ack, **kw)
+            request = jsonutils.loads(payload)
+            reply = impl_bmq.BmqIncomingMessage(
+                ctxt={},
+                message={},
+                reply_q=request['_reply_q'],
+                msg_id='msg-1',
+                post=lambda reply_uri, data: driver._listener_queues[
+                    reply_uri
+                ].put((FakeMessage(data), FakeHandle())),
+            )
+            reply.reply(failure=failure_info)
+
+        session.post = post
+        target = oslo_messaging.Target(topic='conductor')
+        return driver.send(
+            target, {}, {'method': 'x'}, wait_for_reply=True, timeout=5
+        )
+
+    def test_call_raises_original_exception(self):
+        exc = ValueError('bad')
+        self.assertRaisesRegex(
+            ValueError, 'bad', self._call, (ValueError, exc, None)
+        )
+
+    def test_call_raises_allowed_exception(self):
+        exc = oslo_messaging.MessagingTimeout('slow')
+        self.assertRaises(
+            oslo_messaging.MessagingTimeout,
+            self._call,
+            (type(exc), exc, None),
+            ['oslo_messaging.exceptions'],
+        )
+
+    def test_call_raises_remote_error_if_not_allowed(self):
+        exc = oslo_messaging.MessagingTimeout('slow')
+        self.assertRaises(
+            oslo_messaging.RemoteError, self._call, (type(exc), exc, None)
+        )
 
 
 # ---------------------------------------------------------------------------
