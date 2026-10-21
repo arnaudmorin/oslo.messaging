@@ -465,6 +465,36 @@ class TestLogging(BmqTestBase):
             log.warning.assert_called_once()
 
 
+class TestSecurity(BmqTestBase):
+    def _session_kwargs(self, url):
+        driver = self._get_driver(url=url)
+        with mock.patch.object(self.mock_bmq, 'Session') as session_cls:
+            driver._get_session()
+        return session_cls.call_args[1]
+
+    def test_no_credentials_no_tls(self):
+        kwargs = self._session_kwargs('bmq://host:30114/bmq.test.priority')
+        self.assertNotIn('authn_credential_provider', kwargs)
+        self.assertNotIn('tls_certificate_authority', kwargs)
+
+    def test_credentials_from_url(self):
+        kwargs = self._session_kwargs(
+            'bmq://openstack:s%40cret@host:30114/bmq.test.priority'
+        )
+        self.assertEqual('tcp://host:30114', kwargs['broker'])
+        self.assertEqual(
+            ('BASIC', b'openstack:s@cret'),
+            kwargs['authn_credential_provider'](),
+        )
+
+    def test_tls_from_config(self):
+        self.config(ssl_ca_file='/etc/bmq/ca.pem', group='oslo_messaging_bmq')
+        kwargs = self._session_kwargs('bmq://host:30114/bmq.test.priority')
+        self.assertEqual(
+            '/etc/bmq/ca.pem', kwargs['tls_certificate_authority']
+        )
+
+
 # ---------------------------------------------------------------------------
 # Listen
 # ---------------------------------------------------------------------------

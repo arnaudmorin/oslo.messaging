@@ -18,11 +18,13 @@ import queue
 import threading
 import uuid
 
+from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 
 import oslo_messaging
 from oslo_messaging._drivers import base
+from oslo_messaging._drivers import bmq_options
 from oslo_messaging._drivers import common as rpc_common
 
 import blazingmq
@@ -202,12 +204,22 @@ class BmqDriver(base.BaseDriver):
         if bmq_logger.level == std_logging.NOTSET:
             bmq_logger.setLevel(std_logging.WARNING)
 
-        # Parse broker address from URL
+        opt_group = cfg.OptGroup(
+            name='oslo_messaging_bmq', title='BlazingMQ driver options'
+        )
+        conf.register_group(opt_group)
+        conf.register_opts(bmq_options.BMQ_OPTS, group=opt_group)
+        self._ssl_ca_file = conf.oslo_messaging_bmq.ssl_ca_file
+
+        # Parse broker address (and credentials) from URL
+        self._credentials = None
         if url.hosts:
             host = url.hosts[0]
             hostname = host.hostname or 'localhost'
             port = host.port or DEFAULT_PORT
             self._broker = f"tcp://{hostname}:{port}"
+            if host.username:
+                self._credentials = f"{host.username}:{host.password or ''}"
         else:
             self._broker = f"tcp://localhost:{DEFAULT_PORT}"
 
@@ -257,6 +269,20 @@ class BmqDriver(base.BaseDriver):
                 self._uri_locks[uri] = threading.Lock()
             return self._uri_locks[uri]
 
+    def _security_kwargs(self):
+        """Return the blazingmq.Session arguments for authentication and TLS.
+
+        Only set what is configured, so a blazingmq SDK without
+        authentication and TLS support still works when they are not used.
+        """
+        kwargs = {}
+        if self._credentials is not None:
+            credential = ('BASIC', self._credentials.encode())
+            kwargs['authn_credential_provider'] = lambda: credential
+        if self._ssl_ca_file:
+            kwargs['tls_certificate_authority'] = self._ssl_ca_file
+        return kwargs
+
     def _get_session(self):
         """Return the BlazingMQ session, creating it on first use.
 
@@ -270,6 +296,7 @@ class BmqDriver(base.BaseDriver):
                         self._on_session_event,
                         on_message=self._on_message,
                         broker=self._broker,
+                        **self._security_kwargs(),
                     )
                     LOG.info(
                         "BlazingMQ session created: broker=%s domain=%s",
