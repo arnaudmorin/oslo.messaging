@@ -12,6 +12,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import logging
 import queue
 import sys
 import threading
@@ -411,6 +412,34 @@ class TestSendCall(BmqTestBase):
         self.assertRaises(
             oslo_messaging.RemoteError, self._call, (type(exc), exc, None)
         )
+
+
+class TestLogging(BmqTestBase):
+    def setUp(self):
+        super().setUp()
+        bmq_logger = logging.getLogger('blazingmq')
+        self.addCleanup(bmq_logger.setLevel, bmq_logger.level)
+
+    def test_sdk_logs_lowered_to_warning(self):
+        logging.getLogger('blazingmq').setLevel(logging.NOTSET)
+        self._get_driver()
+        self.assertEqual(logging.WARNING, logging.getLogger('blazingmq').level)
+
+    def test_sdk_log_level_kept_if_set(self):
+        logging.getLogger('blazingmq').setLevel(logging.INFO)
+        self._get_driver()
+        self.assertEqual(logging.INFO, logging.getLogger('blazingmq').level)
+
+    def test_session_event_levels(self):
+        driver = self._get_driver()
+        Connected = type('Connected', (), {})
+        ConnectionLost = type('ConnectionLost', (), {})
+        with mock.patch.object(impl_bmq, 'LOG') as log:
+            driver._on_session_event(Connected())
+            log.info.assert_called_once()
+            log.warning.assert_not_called()
+            driver._on_session_event(ConnectionLost())
+            log.warning.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

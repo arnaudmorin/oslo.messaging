@@ -13,6 +13,7 @@
 #    under the License.
 
 import functools
+import logging as std_logging
 import queue
 import threading
 import uuid
@@ -28,6 +29,18 @@ import blazingmq
 
 
 LOG = logging.getLogger(__name__)
+
+# Session events that are part of a normal life cycle, logged at INFO. The
+# others (disconnections, failures, ...) are logged at WARNING.
+NORMAL_SESSION_EVENTS = (
+    'Connected',
+    'Reconnected',
+    'StateRestored',
+    'HostHealthRestored',
+    'QueueResumed',
+    'QueueReopened',
+    'SlowConsumerNormal',
+)
 
 DEFAULT_DOMAIN = 'bmq.openstack.priority'
 DEFAULT_PORT = 30114
@@ -183,6 +196,13 @@ class BmqDriver(base.BaseDriver):
         super().__init__(conf, url, default_exchange,
                          allowed_remote_exmods)
 
+        # NOTE(arnaud) the BlazingMQ SDK logs every queue operation at INFO,
+        # which floods the service logs. Keep its warnings only, unless a
+        # level was set for it (e.g. default_log_levels = blazingmq=INFO).
+        bmq_logger = std_logging.getLogger('blazingmq')
+        if bmq_logger.level == std_logging.NOTSET:
+            bmq_logger.setLevel(std_logging.WARNING)
+
         # Parse broker address from URL
         if url.hosts:
             host = url.hosts[0]
@@ -263,7 +283,10 @@ class BmqDriver(base.BaseDriver):
         only logs the event.
         """
         # TODO work on events
-        LOG.warning("BlazingMQ session event: %s", event)
+        if type(event).__name__ in NORMAL_SESSION_EVENTS:
+            LOG.info("BlazingMQ session event: %s", event)
+        else:
+            LOG.warning("BlazingMQ session event: %s", event)
 
     def _on_message(self, msg, msg_handle):
         """Central message dispatcher, called by BlazingMQ on a background
@@ -277,7 +300,7 @@ class BmqDriver(base.BaseDriver):
         IMPORTANT: Only safe operations are performed here — no session
         method calls except confirm(), to avoid BlazingMQ deadlocks.
         """
-        LOG.info("Received message on %s", msg.queue_uri)
+        LOG.debug("Received message on %s", msg.queue_uri)
         with self._listener_lock:
             # Dispatch the message to the correct queue
             q = self._listener_queues.get(msg.queue_uri)
