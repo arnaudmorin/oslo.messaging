@@ -22,6 +22,7 @@ from oslo_serialization import jsonutils
 
 import oslo_messaging
 from oslo_messaging._drivers import base
+from oslo_messaging._drivers import common as rpc_common
 
 import blazingmq
 
@@ -61,12 +62,9 @@ class BmqIncomingMessage(base.RpcIncomingMessage):
             '_failure': None,
         }
         if failure:
-            body['_failure'] = (
-                failure[0].__name__
-                if hasattr(failure[0], '__name__')
-                else str(failure[0]),
-                str(failure[1]),
-            )
+            # Serialize the exception like the amqp driver does, so the
+            # caller can raise it again with its original class
+            body['_failure'] = rpc_common.serialize_remote_exception(failure)
         payload = jsonutils.dumps(body).encode()
         try:
             # Send the reply message
@@ -518,8 +516,11 @@ class BmqDriver(base.BaseDriver):
             return None
 
         if data.get('_failure'):
-            raise oslo_messaging.RemoteError(
-                data['_failure'][0], data['_failure'][1]
+            # NOTE(arnaud) callers rely on the original exception class
+            # (e.g. nova-compute catches ComputeHostNotFound on startup),
+            # so do not raise a plain RemoteError
+            raise rpc_common.deserialize_remote_exception(
+                data['_failure'], self._allowed_remote_exmods
             )
 
         return data.get('_reply')
