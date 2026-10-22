@@ -377,7 +377,7 @@ class TestSendCast(BmqTestBase):
         session = driver._get_session()
         self.assertTrue(len(session.posted) >= 1)
         uri = session.posted[0][0]
-        self.assertEqual('bmq://bmq.test.priority/compute', uri)
+        self.assertEqual('bmq://bmq.test.priority/openstack.compute', uri)
 
     def test_cast_to_server(self):
         driver = self._get_driver()
@@ -387,7 +387,9 @@ class TestSendCast(BmqTestBase):
         )
 
         uri = driver._get_session().posted[0][0]
-        self.assertEqual('bmq://bmq.test.priority/compute.host1', uri)
+        self.assertEqual(
+            'bmq://bmq.test.priority/openstack.compute.host1', uri
+        )
 
     def test_cast_fanout(self):
         driver = self._get_driver()
@@ -397,7 +399,17 @@ class TestSendCast(BmqTestBase):
         )
 
         uri = driver._get_session().posted[0][0]
-        self.assertEqual('bmq://bmq.test.broadcast/compute', uri)
+        self.assertEqual('bmq://bmq.test.broadcast/openstack.compute', uri)
+
+    def test_cast_to_exchange(self):
+        driver = self._get_driver()
+        target = oslo_messaging.Target(exchange='nova', topic='compute')
+        driver.send(
+            target, {}, {'method': 'x'}, wait_for_reply=False, timeout=5
+        )
+
+        uri = driver._get_session().posted[0][0]
+        self.assertEqual('bmq://bmq.test.priority/nova.compute', uri)
 
 
 class TestSendCall(BmqTestBase):
@@ -520,13 +532,16 @@ class TestListen(BmqTestBase):
         driver.listen(target, batch_size=1, batch_timeout=None)
 
         self.assertIn(
-            'bmq://bmq.test.priority/compute', driver._listener_queues
+            'bmq://bmq.test.priority/openstack.compute',
+            driver._listener_queues,
         )
         self.assertIn(
-            'bmq://bmq.test.priority/compute.host1', driver._listener_queues
+            'bmq://bmq.test.priority/openstack.compute.host1',
+            driver._listener_queues,
         )
         self.assertIn(
-            'bmq://bmq.test.broadcast/compute', driver._listener_queues
+            'bmq://bmq.test.broadcast/openstack.compute',
+            driver._listener_queues,
         )
 
     def test_listen_without_server(self):
@@ -535,10 +550,12 @@ class TestListen(BmqTestBase):
         driver.listen(target, batch_size=1, batch_timeout=None)
 
         self.assertIn(
-            'bmq://bmq.test.priority/compute', driver._listener_queues
+            'bmq://bmq.test.priority/openstack.compute',
+            driver._listener_queues,
         )
         self.assertNotIn(
-            'bmq://bmq.test.priority/compute.host1', driver._listener_queues
+            'bmq://bmq.test.priority/openstack.compute.host1',
+            driver._listener_queues,
         )
 
     def test_listen_for_notifications(self):
@@ -552,11 +569,29 @@ class TestListen(BmqTestBase):
         )
 
         self.assertIn(
-            'bmq://bmq.test.priority/notifications.info',
+            'bmq://bmq.test.priority/openstack.notifications.info',
             driver._listener_queues,
         )
         self.assertIn(
-            'bmq://bmq.test.priority/notifications.error',
+            'bmq://bmq.test.priority/openstack.notifications.error',
+            driver._listener_queues,
+        )
+
+    def test_listen_for_notifications_of_exchanges(self):
+        driver = self._get_driver()
+        targets = [
+            (oslo_messaging.Target(exchange='nova', topic='notif'), 'info'),
+            (oslo_messaging.Target(exchange='cinder', topic='notif'), 'info'),
+        ]
+        driver.listen_for_notifications(
+            targets, pool=None, batch_size=1, batch_timeout=None
+        )
+
+        self.assertIn(
+            'bmq://bmq.test.priority/nova.notif.info', driver._listener_queues
+        )
+        self.assertIn(
+            'bmq://bmq.test.priority/cinder.notif.info',
             driver._listener_queues,
         )
 
@@ -572,9 +607,9 @@ class TestListen(BmqTestBase):
         self.assertEqual(
             sorted(
                 [
-                    'bmq://bmq.test.priority/compute',
-                    'bmq://bmq.test.priority/compute.host1',
-                    'bmq://bmq.test.broadcast/compute',
+                    'bmq://bmq.test.priority/openstack.compute',
+                    'bmq://bmq.test.priority/openstack.compute.host1',
+                    'bmq://bmq.test.broadcast/openstack.compute',
                 ]
             ),
             sorted(session.closed),
@@ -593,7 +628,7 @@ class TestListen(BmqTestBase):
         listener.cleanup()
 
         self.assertEqual(
-            ['bmq://bmq.test.priority/notifications.info'],
+            ['bmq://bmq.test.priority/openstack.notifications.info'],
             driver._get_session().closed,
         )
 
