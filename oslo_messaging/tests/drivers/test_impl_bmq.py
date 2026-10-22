@@ -13,6 +13,7 @@
 #    under the License.
 
 import logging
+import os
 import queue
 import sys
 import threading
@@ -205,6 +206,39 @@ class TestSession(BmqTestBase):
 # ---------------------------------------------------------------------------
 # _open_queue / _close_queue
 # ---------------------------------------------------------------------------
+
+
+class TestFork(BmqTestBase):
+    def test_new_session_after_fork(self):
+        driver = self._get_driver()
+        parent = driver._get_session()
+        driver._open_queue('bmq://d/q', read=True)
+        driver._get_reply_uri()
+
+        with mock.patch('os.getpid', return_value=os.getpid() + 1):
+            child = driver._get_session()
+
+        self.assertIsNot(parent, child)
+        # the session of the parent is kept as is, its queues are forgotten
+        self.assertFalse(parent.stopped)
+        self.assertIn(parent, driver._inherited_sessions)
+        self.assertEqual({}, driver._queues)
+        self.assertIsNone(driver._reply_uri)
+
+    def test_cleanup_after_fork_keeps_parent_session(self):
+        driver = self._get_driver()
+        parent = driver._get_session()
+
+        with mock.patch('os.getpid', return_value=os.getpid() + 1):
+            driver.cleanup()
+
+        self.assertFalse(parent.stopped)
+        self.assertIsNone(driver._session)
+
+    def test_same_session_without_fork(self):
+        driver = self._get_driver()
+        self.assertIs(driver._get_session(), driver._get_session())
+        self.assertEqual([], driver._inherited_sessions)
 
 
 class TestOpenCloseQueue(BmqTestBase):

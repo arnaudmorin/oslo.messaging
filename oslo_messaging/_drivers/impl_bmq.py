@@ -15,6 +15,7 @@
 import functools
 import hashlib
 import logging as std_logging
+import os
 import queue
 import re
 import threading
@@ -264,6 +265,9 @@ class BmqDriver(base.BaseDriver):
         # cleanup() works when __init__ fails.
         self._session = None
         self._session_lock = threading.Lock()
+        # The process which created the session, see _get_session()
+        self._session_pid = None
+        self._inherited_sessions = []
 
         # NOTE(arnaud) the BlazingMQ SDK logs every queue operation at INFO,
         # which floods the service logs. Keep its warnings only, unless a
@@ -381,6 +385,8 @@ class BmqDriver(base.BaseDriver):
         Uses double-checked locking to ensure the session is created
         exactly once even under concurrent access.
         """
+        if self._session is not None and self._session_pid != os.getpid():
+            self._reset_after_fork()
         if self._session is None:
             with self._session_lock:
                 if self._session is None:
@@ -398,12 +404,38 @@ class BmqDriver(base.BaseDriver):
                             f"Failed to connect to the BlazingMQ broker "
                             f"{self._broker}: {e}"
                         ) from e
+                    self._session_pid = os.getpid()
                     LOG.info(
                         "BlazingMQ session created: broker=%s domain=%s",
                         self._broker,
                         self._domain,
                     )
         return self._session
+
+    def _reset_after_fork(self):
+        """Forget the session inherited from the parent process.
+
+        Services fork their workers after the transport was created, and
+        possibly used. The threads of the SDK do not exist in the child,
+        and its session shares the connection of the parent: drop it, with
+        the queues opened by the parent, and create a new one. The session
+        is not stopped, nor destroyed (a reference is kept), as this would
+        close the connection of the parent.
+        """
+        with self._session_lock:
+            if self._session is None or self._session_pid == os.getpid():
+                return
+            LOG.info(
+                "Process forked after the BlazingMQ session was created, "
+                "creating a new session"
+            )
+            self._inherited_sessions.append(self._session)
+            self._session = None
+            self._reply_uri = None
+            self._queues.clear()
+            self._uri_locks.clear()
+            with self._listener_lock:
+                self._listener_queues.clear()
 
     def _on_session_event(self, event):
         """Handle BlazingMQ session-level events (connect, disconnect, etc).
@@ -869,6 +901,9 @@ class BmqDriver(base.BaseDriver):
         Stops the BlazingMQ session (which closes all queues and
         disconnects from the broker) and clears internal tracking state.
         """
+        if self._session is not None and self._session_pid != os.getpid():
+            # the session of the parent process, see _reset_after_fork()
+            self._reset_after_fork()
         if self._session is None:
             return
 
