@@ -387,6 +387,25 @@ class TestBmqIncomingMessage(BmqTestBase):
         msg.reply(reply={'v': 1})
         post_fn.assert_not_called()
 
+    def test_heartbeat_posts_to_reply_queue(self):
+        post = mock.Mock()
+        msg = impl_bmq.BmqIncomingMessage(
+            ctxt={},
+            message={},
+            reply_q='bmq://d/reply.xyz',
+            msg_id='msg-1',
+            post=post,
+            client_timeout=60,
+        )
+        msg.heartbeat()
+
+        uri, payload = post.call_args[0]
+        self.assertEqual('bmq://d/reply.xyz', uri)
+        self.assertEqual(
+            {'_msg_id': 'msg-1', '_heartbeat': True}, jsonutils.loads(payload)
+        )
+        self.assertEqual(60, msg.client_timeout)
+
     def test_requeue_noop(self):
         msg = impl_bmq.BmqIncomingMessage(
             ctxt={}, message={}, reply_q=None, msg_id=None, post=mock.Mock()
@@ -576,6 +595,50 @@ class TestSendCall(BmqTestBase):
             {},
             wait_for_reply=True,
             timeout=0.5,
+        )
+
+    def _monitored_call(self, heartbeats, reply_after):
+        driver = self._get_driver()
+        session = driver._get_session()
+        orig_post = session.post
+        requests = []
+
+        def post(uri, payload, on_ack=None, **kw):
+            orig_post(uri, payload, on_ack=on_ack, **kw)
+            request = jsonutils.loads(payload)
+            requests.append(request)
+            for n in range(heartbeats):
+                threading.Timer(
+                    0.1 * (n + 1),
+                    self._reply_to,
+                    (driver, request),
+                    {'_heartbeat': True},
+                ).start()
+            threading.Timer(
+                reply_after, self._reply_to, (driver, request), {'_reply': 42}
+            ).start()
+
+        session.post = post
+        target = oslo_messaging.Target(topic='conductor')
+        result = driver.send(
+            target,
+            {},
+            {},
+            wait_for_reply=True,
+            timeout=60,
+            call_monitor_timeout=0.3,
+        )
+        self.assertEqual(0.3, requests[0]['_timeout'])
+        return result
+
+    def test_call_monitor_heartbeats(self):
+        # a heartbeat every 0.1s keeps the call alive for 0.6s
+        self.assertEqual(42, self._monitored_call(5, 0.6))
+
+    def test_call_monitor_timeout(self):
+        # no heartbeat: the call fails after 0.3s, not 60s
+        self.assertRaises(
+            oslo_messaging.MessagingTimeout, self._monitored_call, 0, 1
         )
 
     def test_call_raises_original_exception(self):

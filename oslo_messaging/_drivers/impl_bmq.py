@@ -83,10 +83,15 @@ class BmqIncomingMessage(base.RpcIncomingMessage):
     hold a direct reference to the BlazingMQ session.
     """
 
-    def __init__(self, ctxt, message, reply_q, msg_id, post):
+    def __init__(
+        self, ctxt, message, reply_q, msg_id, post, client_timeout=None
+    ):
         super().__init__(ctxt, message, msg_id=msg_id)
         self._reply_q = reply_q
         self._post = post
+        # The call monitor timeout of the caller: the RPC dispatcher sends
+        # heartbeats while the call runs when it is set
+        self.client_timeout = client_timeout
 
     def reply(self, reply=None, failure=None):
         """Send an RPC reply back to the caller.
@@ -124,8 +129,17 @@ class BmqIncomingMessage(base.RpcIncomingMessage):
         LOG.warning("Requeue is not supported by the BlazingMQ driver")
 
     def heartbeat(self):
-        """No-op heartbeat. BlazingMQ manages connection health internally."""
-        pass
+        """Tell the caller that the call is still running.
+
+        Called by the RPC dispatcher when the caller set a call monitor
+        timeout. The heartbeat is sent to the reply queue of the caller,
+        like the reply. Failures are raised, the dispatcher then stops
+        sending heartbeats.
+        """
+        if not self._reply_q:
+            return
+        body = {'_msg_id': self.msg_id, '_heartbeat': True}
+        self._post(self._reply_q, jsonutils.dumps(body).encode())
 
 
 class BmqListener(base.PollStyleListener):
@@ -182,11 +196,14 @@ class BmqListener(base.PollStyleListener):
         ctxt = data.pop('_context', None)
         reply_q = data.pop('_reply_q', None)
         msg_id = data.pop('_msg_id', None)
+        client_timeout = data.pop('_timeout', None)
 
         # Confirm delivery to BlazingMQ
         handle.confirm()
 
-        return BmqIncomingMessage(ctxt, data, reply_q, msg_id, self._post_fn)
+        return BmqIncomingMessage(
+            ctxt, data, reply_q, msg_id, self._post_fn, client_timeout
+        )
 
     def stop(self):
         """Signal the listener to stop polling and close its queues.
@@ -626,6 +643,7 @@ class BmqDriver(base.BaseDriver):
         message,
         wait_for_reply=None,
         timeout=None,
+        call_monitor_timeout=None,
         retry=None,
     ):
         """Core send implementation for both RPC calls and casts.
@@ -633,7 +651,9 @@ class BmqDriver(base.BaseDriver):
         For casts (wait_for_reply=False): posts the message and returns.
         For calls (wait_for_reply=True): posts the message with the reply
         queue of the driver and the id of the call, then blocks until
-        the reply arrives or timeout expires.
+        the reply arrives or timeout expires. With a call monitor timeout,
+        the server sends heartbeats while the call runs, and the call
+        fails if they stop for longer than call_monitor_timeout.
         """
         # Determine destination queue URI
         if target.fanout:
@@ -665,15 +685,32 @@ class BmqDriver(base.BaseDriver):
         msg_id = uuid.uuid4().hex
         message['_msg_id'] = msg_id
         message['_reply_q'] = self._get_reply_uri()
+        if call_monitor_timeout:
+            message['_timeout'] = call_monitor_timeout
+            cm_timer = rpc_common.DecayingTimer(duration=call_monitor_timeout)
+            cm_timer.start()
+        else:
+            cm_timer = None
         waiter = queue.Queue()
         self._waiters[msg_id] = waiter
         try:
             payload = jsonutils.dumps(message).encode()
             self._post(uri, payload, retry=retry, timeout=timer.check_return())
-            try:
-                data = waiter.get(timeout=timer.check_return(timed_out))
-            except queue.Empty:
-                timed_out()
+            while True:
+                left = timer.check_return(timed_out)
+                if cm_timer:
+                    left = cm_timer.check_return(timed_out, maximum=left)
+                try:
+                    data = waiter.get(timeout=left)
+                except queue.Empty:
+                    timed_out()
+                if not data.get('_heartbeat'):
+                    break
+                LOG.debug(
+                    'Call monitor heartbeat received; renewing timeout timer'
+                )
+                if cm_timer:
+                    cm_timer.restart()
         finally:
             del self._waiters[msg_id]
 
@@ -710,7 +747,13 @@ class BmqDriver(base.BaseDriver):
             wait_for_reply,
         )
         return self._send(
-            target, ctxt, message, wait_for_reply, timeout, retry
+            target,
+            ctxt,
+            message,
+            wait_for_reply,
+            timeout,
+            call_monitor_timeout,
+            retry,
         )
 
     def send_notification(self, target, ctxt, message, version, retry=None):
