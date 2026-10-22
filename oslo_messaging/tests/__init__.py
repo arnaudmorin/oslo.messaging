@@ -13,5 +13,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import os
+
 import eventlet
-eventlet.monkey_patch()
+
+# NOTE(arnaud) set OSLO_MESSAGING_TEST_EVENTLET=0 to run the tests with
+# native threads, e.g. the functional tests of a driver whose library runs
+# its own threads, which does not work with eventlet monkey patching
+if os.environ.get('OSLO_MESSAGING_TEST_EVENTLET', '1') != '0':
+    eventlet.monkey_patch()

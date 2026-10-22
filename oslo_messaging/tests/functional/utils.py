@@ -16,6 +16,7 @@ import queue
 import time
 import uuid
 
+import eventlet
 import fixtures
 from oslo_config import cfg
 
@@ -23,6 +24,12 @@ import oslo_messaging
 from oslo_messaging._drivers.kafka_driver import kafka_options
 from oslo_messaging.notify import notifier
 from oslo_messaging.tests import utils as test_utils
+
+# The executor of the servers: eventlet unless the tests run with native
+# threads (see oslo_messaging/tests/__init__.py)
+EXECUTOR = (
+    'eventlet' if eventlet.patcher.is_monkey_patched('thread') else 'threading'
+)
 
 
 class TestServerEndpoint:
@@ -95,7 +102,7 @@ class RpcServerFixture(fixtures.Fixture):
     """Fixture to setup the TestServerEndpoint."""
 
     def __init__(self, conf, url, target, endpoint=None, ctrl_target=None,
-                 executor='eventlet'):
+                 executor=EXECUTOR):
         super().__init__()
         self.conf = conf
         self.url = url
@@ -348,7 +355,7 @@ class NotificationFixture(fixtures.Fixture):
         return oslo_messaging.get_notification_listener(
             transport.transport,
             targets,
-            [self], 'eventlet')
+            [self], EXECUTOR)
 
     def _start(self):
         self.thread = test_utils.ServerThreadHelper(self.server)
@@ -411,7 +418,7 @@ class BatchNotificationFixture(NotificationFixture):
         return oslo_messaging.get_batch_notification_listener(
             transport.transport,
             targets,
-            [self], 'eventlet',
+            [self], EXECUTOR,
             batch_timeout=self.batch_timeout,
             batch_size=self.batch_size)
 
