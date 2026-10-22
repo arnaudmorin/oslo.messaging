@@ -726,6 +726,18 @@ class TestLogging(BmqTestBase):
             driver._on_session_event(ConnectionLost())
             log.warning.assert_called_once()
 
+    def test_disconnected_on_cleanup_is_info(self):
+        driver = self._get_driver()
+        session = driver._get_session()
+        Disconnected = type('Disconnected', (), {})
+        session.stop = lambda: driver._on_session_event(Disconnected())
+        with mock.patch.object(impl_bmq, 'LOG') as log:
+            driver._on_session_event(Disconnected())
+            log.warning.assert_called_once()
+            driver.cleanup()
+            log.info.assert_called_once()
+            log.warning.assert_called_once()
+
 
 class TestSecurity(BmqTestBase):
     def _session_kwargs(self, url):

@@ -268,6 +268,8 @@ class BmqDriver(base.BaseDriver):
         # The process which created the session, see _get_session()
         self._session_pid = None
         self._inherited_sessions = []
+        # Set while cleanup() stops the session
+        self._stopping = False
 
         # NOTE(arnaud) the BlazingMQ SDK logs every queue operation at INFO,
         # which floods the service logs. Keep its warnings only, unless a
@@ -444,7 +446,11 @@ class BmqDriver(base.BaseDriver):
         only logs the event.
         """
         # TODO(arnaud) work on events
-        if type(event).__name__ in NORMAL_SESSION_EVENTS:
+        name = type(event).__name__
+        if name in NORMAL_SESSION_EVENTS or (
+            # the disconnection requested by cleanup()
+            name == 'Disconnected' and self._stopping
+        ):
             LOG.info("BlazingMQ session event: %s", event)
         else:
             LOG.warning("BlazingMQ session event: %s", event)
@@ -908,10 +914,13 @@ class BmqDriver(base.BaseDriver):
             return
 
         # session.stop() closes all queues and disconnects
+        self._stopping = True
         try:
             self._session.stop()
         except Exception:
             LOG.debug('Failed to stop the BlazingMQ session', exc_info=True)
+        finally:
+            self._stopping = False
         self._session = None
         self._reply_uri = None
         self._queues.clear()
