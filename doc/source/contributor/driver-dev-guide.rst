@@ -14,7 +14,9 @@ This document is a *best practices* guide for the developer interested
 in creating a new transport driver for Oslo.Messaging.  It should also
 be used by maintainers as a reference for proper driver behavior.
 This document will describe the driver interface and prescribe the
-expected behavior of any driver implemented to this interface.
+expected behavior of any driver implemented to this interface. See
+:doc:`writing-a-driver` for a walkthrough of the creation of a new
+driver.
 
 **Note well:** The API described in this document is internal to the
 oslo.messaging library and therefore **private**.  Under no
