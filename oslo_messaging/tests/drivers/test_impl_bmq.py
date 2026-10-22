@@ -465,7 +465,7 @@ class TestSendCast(BmqTestBase):
             timeout=5,
         )
 
-        session = driver._get_session()
+        session = driver._get_producer()
         self.assertTrue(len(session.posted) >= 1)
         uri = session.posted[0][0]
         self.assertEqual('bmq://bmq.test.priority/openstack.compute', uri)
@@ -477,7 +477,7 @@ class TestSendCast(BmqTestBase):
             target, {}, {'method': 'x'}, wait_for_reply=False, timeout=5
         )
 
-        uri = driver._get_session().posted[0][0]
+        uri = driver._get_producer().posted[0][0]
         self.assertEqual(
             'bmq://bmq.test.priority/openstack.compute.host1', uri
         )
@@ -489,7 +489,7 @@ class TestSendCast(BmqTestBase):
             target, {}, {'method': 'x'}, wait_for_reply=False, timeout=5
         )
 
-        uri = driver._get_session().posted[0][0]
+        uri = driver._get_producer().posted[0][0]
         self.assertEqual('bmq://bmq.test.broadcast/openstack.compute', uri)
 
     def test_cast_to_exchange(self):
@@ -499,15 +499,64 @@ class TestSendCast(BmqTestBase):
             target, {}, {'method': 'x'}, wait_for_reply=False, timeout=5
         )
 
-        uri = driver._get_session().posted[0][0]
+        uri = driver._get_producer().posted[0][0]
         self.assertEqual('bmq://bmq.test.priority/nova.compute', uri)
+
+
+class TestWriters(BmqTestBase):
+    def _cast(self, driver, topic):
+        driver.send(
+            oslo_messaging.Target(topic=topic),
+            {},
+            {},
+            wait_for_reply=False,
+            timeout=5,
+        )
+
+    def test_writer_kept_open(self):
+        driver = self._get_driver()
+        for _ in range(3):
+            self._cast(driver, 'compute')
+
+        producer = driver._get_producer()
+        uri = 'bmq://bmq.test.priority/openstack.compute'
+        self.assertEqual([(uri, False, True)], producer.opened)
+        self.assertEqual([], producer.closed)
+        self.assertEqual(3, len(producer.posted))
+
+    def test_least_recently_used_writer_closed(self):
+        self.useFixture(fixtures.MockPatchObject(impl_bmq, 'MAX_WRITERS', 2))
+        driver = self._get_driver()
+        for topic in ('a', 'b', 'a', 'c'):
+            self._cast(driver, topic)
+
+        self.assertEqual(
+            ['bmq://bmq.test.priority/openstack.b'],
+            driver._get_producer().closed,
+        )
+
+    def test_post_to_listened_queue(self):
+        driver = self._get_driver()
+        driver.listen(
+            oslo_messaging.Target(topic='compute', server='host1'), 1, None
+        )
+        self._cast(driver, 'compute')
+
+        # the queue of the listener is left as is
+        session = driver._get_session()
+        self.assertEqual([], session.closed)
+        self.assertEqual([], session.posted)
+        self.assertTrue(
+            driver._queues['bmq://bmq.test.priority/openstack.compute']['read']
+        )
+        self.assertEqual(1, len(driver._get_producer().posted))
 
 
 class TestSendCall(BmqTestBase):
     def _call(self, failure_info, allowed_remote_exmods=None):
         driver = self._get_driver()
         driver._allowed_remote_exmods = allowed_remote_exmods or []
-        session = driver._get_session()
+        session = driver._get_producer()
         orig_post = session.post
 
         # Reply with the failure as soon as the call is posted
@@ -542,7 +591,7 @@ class TestSendCall(BmqTestBase):
 
     def test_calls_share_the_reply_queue(self):
         driver = self._get_driver()
-        session = driver._get_session()
+        session = driver._get_producer()
         orig_post = session.post
         requests = []
 
@@ -567,15 +616,16 @@ class TestSendCall(BmqTestBase):
         self.assertEqual(3, len({r['_msg_id'] for r in requests}))
         # the reply queue is opened once, and stays open
         reply_uri = reply_queues.pop()
+        listening = driver._get_session()
         self.assertEqual(
-            1, len([o for o in session.opened if o[0] == reply_uri])
+            1, len([o for o in listening.opened if o[0] == reply_uri])
         )
-        self.assertNotIn(reply_uri, session.closed)
+        self.assertNotIn(reply_uri, listening.closed)
         self.assertEqual({}, driver._waiters)
 
     def test_reply_of_another_call_is_dropped(self):
         driver = self._get_driver()
-        session = driver._get_session()
+        session = driver._get_producer()
         orig_post = session.post
 
         def post(uri, payload, on_ack=None, **kw):
@@ -608,7 +658,7 @@ class TestSendCall(BmqTestBase):
 
     def test_call_timeout_covers_ack_and_reply(self):
         driver = self._get_driver()
-        session = driver._get_session()
+        session = driver._get_producer()
 
         # the broker acks after 0.3s, the reply comes 0.3s later: each
         # step is shorter than the timeout, but not the call
@@ -634,7 +684,7 @@ class TestSendCall(BmqTestBase):
 
     def _monitored_call(self, heartbeats, reply_after):
         driver = self._get_driver()
-        session = driver._get_session()
+        session = driver._get_producer()
         orig_post = session.post
         requests = []
 
@@ -946,7 +996,7 @@ class TestErrors(BmqTestBase):
 
     def _cast_with_failures(self, failures, retry):
         driver = self._get_driver()
-        session = driver._get_session()
+        session = driver._get_producer()
         orig_post = session.post
         calls = []
 

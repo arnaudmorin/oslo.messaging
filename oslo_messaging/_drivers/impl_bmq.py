@@ -12,6 +12,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections
 import functools
 import hashlib
 import logging as std_logging
@@ -52,6 +53,8 @@ DEFAULT_DOMAIN = 'bmq.openstack.priority'
 DEFAULT_PORT = 30114
 # Maximum delay between two attempts to post a message, in seconds
 MAX_RETRY_DELAY = 5
+# Maximum number of queues kept open for writing by a driver
+MAX_WRITERS = 512
 
 # Queue names are limited by BlazingMQ to 64 characters, among letters,
 # digits, '-', '_' and '.' (see bmqt::Uri)
@@ -260,10 +263,15 @@ class BmqDriver(base.BaseDriver):
     ):
         super().__init__(conf, url, default_exchange, allowed_remote_exmods)
 
-        # Session is created lazily on first use to avoid connecting
-        # to the broker at import/construction time. Set it first, so that
-        # cleanup() works when __init__ fails.
+        # Sessions are created lazily on first use to avoid connecting
+        # to the broker at import/construction time. Set them first, so
+        # that cleanup() works when __init__ fails. The session receives
+        # the messages of the listeners and the replies, the producer
+        # session posts all the messages: a queue a driver listens to is
+        # also posted to, e.g. by a service calling itself, and the SDK
+        # does not allow to open a queue twice in a session.
         self._session = None
+        self._producer = None
         self._session_lock = threading.Lock()
         # The process which created the session, see _get_session()
         self._session_pid = None
@@ -322,21 +330,20 @@ class BmqDriver(base.BaseDriver):
         # Tracks which queues are currently open on the BlazingMQ session
         # and with which flags: uri -> {'read': bool, 'write': bool}.
         # Used to avoid duplicate open_queue calls (which would cause
-        # BlazingMQ to hang) and to restore flags after a temporary
-        # write-only switch during _post/_send.
+        # BlazingMQ to hang).
         self._queues = {}
-        # Note: _queues_lock is technically redundant with _uri_locks
-        # (which serialize same-URI operations) and CPython's GIL (which
-        # makes dict mutations atomic for different URIs). We keep it as
-        # a safety net for non-CPython implementations where the GIL may
-        # not exist (e.g. PyPy STM, future free-threaded CPython).
         self._queues_lock = threading.Lock()
 
-        # Per-URI locks to serialize flag-switching operations (_post/_send)
-        # on the same queue. Without this, two threads sending to the same
-        # queue could step on each other's read/write flag transitions.
+        # Per-URI locks to serialize the opening of a queue for writing:
+        # two threads posting to the same queue would otherwise open it
+        # twice, which would cause BlazingMQ to hang.
         self._uri_locks = {}
         self._uri_locks_lock = threading.Lock()
+
+        # Queues opened for writing in the producer session, kept open in
+        # least recently used order, up to MAX_WRITERS
+        self._writers = collections.OrderedDict()
+        self._writers_lock = threading.Lock()
 
         # RPC replies: a single reply queue for the driver, opened on the
         # first call, and the calls waiting for a reply, by message id
@@ -381,60 +388,82 @@ class BmqDriver(base.BaseDriver):
             kwargs['tls_certificate_authority'] = self._ssl_ca_file
         return kwargs
 
+    def _create_session(self, on_message=None):
+        try:
+            session = blazingmq.Session(
+                self._on_session_event,
+                on_message=on_message,
+                broker=self._broker,
+                **self._security_kwargs(),
+            )
+        except Exception as e:
+            # e.g. BrokerTimeoutError, when the broker is not reachable or
+            # refuses the credentials
+            raise oslo_messaging.MessageDeliveryFailure(
+                f"Failed to connect to the BlazingMQ broker "
+                f"{self._broker}: {e}"
+            ) from e
+        LOG.info(
+            "BlazingMQ session created: broker=%s domain=%s",
+            self._broker,
+            self._domain,
+        )
+        return session
+
     def _get_session(self):
-        """Return the BlazingMQ session, creating it on first use.
+        """Return the session of the listeners, creating it on first use.
 
         Uses double-checked locking to ensure the session is created
         exactly once even under concurrent access.
         """
-        if self._session is not None and self._session_pid != os.getpid():
+        if self._session_pid not in (None, os.getpid()):
             self._reset_after_fork()
         if self._session is None:
             with self._session_lock:
                 if self._session is None:
-                    try:
-                        self._session = blazingmq.Session(
-                            self._on_session_event,
-                            on_message=self._on_message,
-                            broker=self._broker,
-                            **self._security_kwargs(),
-                        )
-                    except Exception as e:
-                        # e.g. BrokerTimeoutError, when the broker is not
-                        # reachable or refuses the credentials
-                        raise oslo_messaging.MessageDeliveryFailure(
-                            f"Failed to connect to the BlazingMQ broker "
-                            f"{self._broker}: {e}"
-                        ) from e
-                    self._session_pid = os.getpid()
-                    LOG.info(
-                        "BlazingMQ session created: broker=%s domain=%s",
-                        self._broker,
-                        self._domain,
+                    self._session = self._create_session(
+                        on_message=self._on_message
                     )
+                    self._session_pid = os.getpid()
         return self._session
+
+    def _get_producer(self):
+        """Return the session posting the messages, created on first use."""
+        if self._session_pid not in (None, os.getpid()):
+            self._reset_after_fork()
+        if self._producer is None:
+            with self._session_lock:
+                if self._producer is None:
+                    self._producer = self._create_session()
+                    self._session_pid = os.getpid()
+        return self._producer
 
     def _reset_after_fork(self):
         """Forget the session inherited from the parent process.
 
         Services fork their workers after the transport was created, and
         possibly used. The threads of the SDK do not exist in the child,
-        and its session shares the connection of the parent: drop it, with
-        the queues opened by the parent, and create a new one. The session
-        is not stopped, nor destroyed (a reference is kept), as this would
-        close the connection of the parent.
+        and its sessions share the connections of the parent: drop them,
+        with the queues opened by the parent, and create new ones. The
+        sessions are not stopped, nor destroyed (a reference is kept), as
+        this would close the connections of the parent.
         """
         with self._session_lock:
-            if self._session is None or self._session_pid == os.getpid():
+            if self._session_pid in (None, os.getpid()):
                 return
             LOG.info(
                 "Process forked after the BlazingMQ session was created, "
                 "creating a new session"
             )
-            self._inherited_sessions.append(self._session)
+            for session in (self._session, self._producer):
+                if session is not None:
+                    self._inherited_sessions.append(session)
             self._session = None
+            self._producer = None
+            self._session_pid = None
             self._reply_uri = None
             self._queues.clear()
+            self._writers.clear()
             self._uri_locks.clear()
             with self._listener_lock:
                 self._listener_queues.clear()
@@ -513,10 +542,10 @@ class BmqDriver(base.BaseDriver):
         return self._reply_uri
 
     def _open_queue(self, uri, read=False, write=False):
-        """Open or reopen a queue with the requested flags.
+        """Open or reopen a queue of the session with the requested flags.
 
-        A queue must be opened for read OR write, never both. Opening
-        for read+write would cause the sender to receive its own messages.
+        The session only reads, the producer session posts the messages
+        (see _open_writer), so a queue is opened for read OR write.
 
         BlazingMQ does not allow calling open_queue twice on the same URI.
         If the queue is already open with different flags, we close it
@@ -603,21 +632,50 @@ class BmqDriver(base.BaseDriver):
             # The queue is not used anymore, the broker closes it with the
             # session at the latest
             LOG.warning('Failed to close queue %s', uri, exc_info=True)
-        # Clean up the per-URI lock since the queue is gone
-        with self._uri_locks_lock:
-            self._uri_locks.pop(uri, None)
+
+    def _open_writer(self, uri):
+        """Open a queue for writing in the producer session.
+
+        The queue stays open for the next messages, the least recently
+        used queue is closed when more than MAX_WRITERS are open.
+        """
+        with self._writers_lock:
+            if uri in self._writers:
+                self._writers.move_to_end(uri)
+                return
+        evicted = None
+        with self._get_uri_lock(uri):
+            with self._writers_lock:
+                if uri in self._writers:
+                    return
+            try:
+                self._get_producer().open_queue(uri, write=True)
+            except blazingmq.Error as e:
+                raise oslo_messaging.MessageDeliveryFailure(
+                    f"Failed to open the BlazingMQ queue {uri}: {e}"
+                ) from e
+            with self._writers_lock:
+                self._writers[uri] = True
+                if len(self._writers) > MAX_WRITERS:
+                    evicted, _ = self._writers.popitem(last=False)
+        if evicted:
+            self._close_writer(evicted)
+
+    def _close_writer(self, uri):
+        """Close a queue opened by _open_writer."""
+        with self._writers_lock:
+            self._writers.pop(uri, None)
+        try:
+            self._get_producer().close_queue(uri)
+        except (blazingmq.Error, oslo_messaging.MessageDeliveryFailure):
+            LOG.debug('Failed to close queue %s', uri, exc_info=True)
 
     def _post(self, uri, payload, retry=None, timeout=None):
         """Post a message to a queue with retry and ACK support.
 
-        Handles the full write lifecycle:
-          1. Saves the current queue flags (if any)
-          2. Switches the queue to write-only (to avoid receiving our
-             own message if we are also listening on this queue)
-          3. Posts the message and waits for broker acknowledgment
-          4. Retries on failure according to the retry parameter
-          5. Restores the previous queue flags (or closes if it was
-             not open before)
+        The message is posted by the producer session, in a queue kept
+        open for writing (see _open_writer), and the broker
+        acknowledgment is awaited.
 
         Args:
             uri: BlazingMQ queue URI to post to.
@@ -635,81 +693,59 @@ class BmqDriver(base.BaseDriver):
         elif retry > 0:
             max_attempts = retry + 1
 
-        with self._get_uri_lock(uri):
-            with self._queues_lock:
-                existing = self._queues.get(uri)
-                # Defensive copy: _open_queue replaces the dict in
-                # self._queues, so a reference would still work today,
-                # but a copy protects against future in-place mutations.
-                previous = existing.copy() if existing else None
+        def on_ack(status_dict, event, ack):
+            status_dict['status'] = ack.status
+            event.set()
 
-            attempt = 0
+        attempt = 0
+        while True:
+            attempt += 1
+            ack_event = threading.Event()
+            ack_status = {}
+
             try:
-                while True:
-                    attempt += 1
-                    ack_event = threading.Event()
-                    ack_status = {}
+                self._open_writer(uri)
+                self._get_producer().post(
+                    uri,
+                    payload,
+                    on_ack=functools.partial(on_ack, ack_status, ack_event),
+                )
+            except (
+                blazingmq.Error,
+                oslo_messaging.MessageDeliveryFailure,
+            ) as e:
+                if max_attempts and attempt >= max_attempts:
+                    raise oslo_messaging.MessageDeliveryFailure(str(e))
+                LOG.warning('Failed to post to %s, retrying: %s', uri, e)
+                # reopen the queue on the next attempt
+                self._close_writer(uri)
+                time.sleep(min(attempt, MAX_RETRY_DELAY))
+                continue
 
-                    def on_ack(status_dict, event, ack):
-                        status_dict['status'] = ack.status
-                        event.set()
+            # Wait for broker acknowledgment
+            ack_received = ack_event.wait(timeout=timeout)
+            if not ack_received:
+                raise oslo_messaging.MessagingTimeout(
+                    f"Timeout waiting for broker ack on {uri}"
+                )
 
-                    try:
-                        self._open_queue(uri, write=True)
-                        self._get_session().post(
-                            uri,
-                            payload,
-                            on_ack=functools.partial(
-                                on_ack, ack_status, ack_event
-                            ),
+            if ack_status.get('status') != blazingmq.AckStatus.SUCCESS:
+                if max_attempts and attempt >= max_attempts:
+                    raise oslo_messaging.MessageDeliveryFailure(
+                        "BlazingMQ post failed with status: {}".format(
+                            ack_status.get('status')
                         )
-                    except (
-                        blazingmq.Error,
-                        oslo_messaging.MessageDeliveryFailure,
-                    ) as e:
-                        if max_attempts and attempt >= max_attempts:
-                            raise oslo_messaging.MessageDeliveryFailure(str(e))
-                        LOG.warning(
-                            'Failed to post to %s, retrying: %s', uri, e
-                        )
-                        time.sleep(min(attempt, MAX_RETRY_DELAY))
-                        continue
+                    )
+                LOG.warning(
+                    'Post to %s failed with status %s, retrying',
+                    uri,
+                    ack_status.get('status'),
+                )
+                time.sleep(min(attempt, MAX_RETRY_DELAY))
+                continue
 
-                    # Wait for broker acknowledgment
-                    ack_received = ack_event.wait(timeout=timeout)
-                    if not ack_received:
-                        raise oslo_messaging.MessagingTimeout(
-                            f"Timeout waiting for broker ack on {uri}"
-                        )
-
-                    if ack_status.get('status') != blazingmq.AckStatus.SUCCESS:
-                        if max_attempts and attempt >= max_attempts:
-                            raise oslo_messaging.MessageDeliveryFailure(
-                                "BlazingMQ post failed with status: {}".format(
-                                    ack_status.get('status')
-                                )
-                            )
-                        LOG.warning(
-                            'Post to %s failed with status %s, retrying',
-                            uri,
-                            ack_status.get('status'),
-                        )
-                        time.sleep(min(attempt, MAX_RETRY_DELAY))
-                        continue
-
-                    # Message delivered successfully
-                    break
-            finally:
-                # Always restore the queue's previous flags
-                if previous:
-                    try:
-                        self._open_queue(uri, **previous)
-                    except oslo_messaging.MessageDeliveryFailure:
-                        LOG.warning(
-                            'Failed to reopen queue %s', uri, exc_info=True
-                        )
-                else:
-                    self._close_queue(uri)
+            # Message delivered successfully
+            return
 
     def _context_packing(self, context):
         """Serialize an oslo.messaging context to a dict for JSON transport."""
@@ -904,26 +940,33 @@ class BmqDriver(base.BaseDriver):
     def cleanup(self):
         """Tear down the driver and release all resources.
 
-        Stops the BlazingMQ session (which closes all queues and
+        Stops the BlazingMQ sessions (which closes all queues and
         disconnects from the broker) and clears internal tracking state.
         """
-        if self._session is not None and self._session_pid != os.getpid():
-            # the session of the parent process, see _reset_after_fork()
+        if self._session_pid not in (None, os.getpid()):
+            # the sessions of the parent process, see _reset_after_fork()
             self._reset_after_fork()
-        if self._session is None:
-            return
 
         # session.stop() closes all queues and disconnects
         self._stopping = True
         try:
-            self._session.stop()
-        except Exception:
-            LOG.debug('Failed to stop the BlazingMQ session', exc_info=True)
+            for session in (self._session, self._producer):
+                if session is None:
+                    continue
+                try:
+                    session.stop()
+                except Exception:
+                    LOG.debug(
+                        'Failed to stop the BlazingMQ session', exc_info=True
+                    )
         finally:
             self._stopping = False
         self._session = None
+        self._producer = None
+        self._session_pid = None
         self._reply_uri = None
         self._queues.clear()
+        self._writers.clear()
         self._listener_queues.clear()
         self._uri_locks.clear()
 
