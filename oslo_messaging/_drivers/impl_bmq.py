@@ -278,6 +278,22 @@ class BmqDriver(base.BaseDriver):
         self._session = None
         self._session_lock = threading.Lock()
 
+    def _queue_uri(self, target, suffix=None, fanout=False):
+        """Return the URI of the queue of a target.
+
+        The queue name is <exchange>.<topic>[.<suffix>], the suffix being
+        the server of an RPC target or the priority of a notification.
+        It starts with the exchange, as services use topics with the same
+        name in different exchanges (e.g. notifications).
+        """
+        exchange = target.exchange or self._default_exchange
+        name = f"{exchange}.{target.topic}"
+        if fanout:
+            return f"bmq://{self._broadcast_domain}/{name}"
+        if suffix:
+            name = f"{name}.{suffix}"
+        return f"bmq://{self._domain}/{name}"
+
     def _get_uri_lock(self, uri):
         """Return a per-URI lock, creating it if needed."""
         with self._uri_locks_lock:
@@ -549,11 +565,9 @@ class BmqDriver(base.BaseDriver):
         """
         # Determine destination queue URI
         if target.fanout:
-            uri = f"bmq://{self._broadcast_domain}/{target.topic}"
-        elif target.server is not None:
-            uri = f"bmq://{self._domain}/{target.topic}.{target.server}"
+            uri = self._queue_uri(target, fanout=True)
         else:
-            uri = f"bmq://{self._domain}/{target.topic}"
+            uri = self._queue_uri(target, target.server)
 
         # Pack context
         if ctxt:
@@ -653,18 +667,18 @@ class BmqDriver(base.BaseDriver):
         listener = BmqListener(self._post, self._close_listener_queue)
 
         # topic
-        uri = f"bmq://{self._domain}/{target.topic}"
+        uri = self._queue_uri(target)
         self._add_listener_queue(listener, uri)
         LOG.info("Starting listener on %s", uri)
 
         # topic.server
         if target.server:
-            uri = f"bmq://{self._domain}/{target.topic}.{target.server}"
+            uri = self._queue_uri(target, target.server)
             self._add_listener_queue(listener, uri)
             LOG.info("Starting listener on %s", uri)
 
         # fanout
-        uri = f"bmq://{self._broadcast_domain}/{target.topic}"
+        uri = self._queue_uri(target, fanout=True)
         self._add_listener_queue(listener, uri)
         LOG.info("Starting listener on %s", uri)
 
@@ -691,7 +705,7 @@ class BmqDriver(base.BaseDriver):
         listener = BmqListener(self._post, self._close_listener_queue)
 
         for target, priority in targets_and_priorities:
-            uri = f"bmq://{self._domain}/{target.topic}.{priority}"
+            uri = self._queue_uri(target, priority)
             self._add_listener_queue(listener, uri)
             LOG.info("Starting listener for notifications on %s", uri)
 
