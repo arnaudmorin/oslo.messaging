@@ -211,6 +211,7 @@ class CallTestCase(utils.SkipIfNoTransportURL):
         if not (
             self.rpc_url.startswith("rabbit://")
             or self.rpc_url.startswith("amqp://")
+            or self.rpc_url.startswith("bmq://")
         ):
             self.skipTest("backend does not support call monitoring")
 
