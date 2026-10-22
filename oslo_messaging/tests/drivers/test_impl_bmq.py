@@ -138,6 +138,13 @@ class TestTransportURL(BmqTestBase):
             'bmq.test.broadcast',
         )
 
+    def test_invalid_domain(self):
+        self.assertRaises(
+            oslo_messaging.InvalidTransportURL,
+            self._get_driver,
+            'bmq://host:30114/bmq..priority',
+        )
+
     def test_all_defaults(self):
         self._check(
             'bmq://',
@@ -150,6 +157,34 @@ class TestTransportURL(BmqTestBase):
 # ---------------------------------------------------------------------------
 # Session
 # ---------------------------------------------------------------------------
+
+
+class TestQueueName(test_utils.BaseTestCase):
+    def test_valid_name_kept(self):
+        self.assertEqual(
+            'nova.compute.host-1', impl_bmq.queue_name('nova.compute.host-1')
+        )
+
+    def test_invalid_chars(self):
+        name = impl_bmq.queue_name('cinder.cinder-volume.host@lvm')
+        self.assertRegex(
+            name, r'^cinder\.cinder-volume\.host_lvm_[0-9a-f]{16}$'
+        )
+        # not the queue of another name with the same valid form
+        self.assertNotEqual(
+            name, impl_bmq.queue_name('cinder.cinder-volume.host#lvm')
+        )
+
+    def test_too_long(self):
+        long_name = 'neutron.q-agent-notifier-port-update.' + 'c' * 40
+        name = impl_bmq.queue_name(long_name)
+        self.assertEqual(64, len(name))
+        self.assertTrue(name.startswith('neutron.q-agent-notifier'))
+        self.assertNotEqual(name, impl_bmq.queue_name(long_name + 'x'))
+
+    def test_max_length_kept(self):
+        name = 'a' * 64
+        self.assertEqual(name, impl_bmq.queue_name(name))
 
 
 class TestSession(BmqTestBase):

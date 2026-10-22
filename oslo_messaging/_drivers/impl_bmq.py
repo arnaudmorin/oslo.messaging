@@ -13,8 +13,10 @@
 #    under the License.
 
 import functools
+import hashlib
 import logging as std_logging
 import queue
+import re
 import threading
 import uuid
 
@@ -46,6 +48,30 @@ NORMAL_SESSION_EVENTS = (
 
 DEFAULT_DOMAIN = 'bmq.openstack.priority'
 DEFAULT_PORT = 30114
+
+# Queue names are limited by BlazingMQ to 64 characters, among letters,
+# digits, '-', '_' and '.' (see bmqt::Uri)
+QUEUE_NAME_MAX_LENGTH = 64
+INVALID_QUEUE_NAME_CHARS = re.compile(r'[^-a-zA-Z0-9_.]')
+# Domain names: same characters, without consecutive dots
+VALID_DOMAIN = re.compile(r'^[-a-zA-Z0-9_]+(\.[-a-zA-Z0-9_]+)*$')
+
+
+def queue_name(name):
+    """Return a valid BlazingMQ queue name for name.
+
+    Valid names are kept. The others (too long, or with characters like
+    the '@' of the cinder-volume servers) are made valid, and suffixed
+    with a hash of the name, so that two names stay two queues.
+    """
+    if len(
+        name
+    ) <= QUEUE_NAME_MAX_LENGTH and not INVALID_QUEUE_NAME_CHARS.search(name):
+        return name
+    digest = hashlib.sha256(name.encode()).hexdigest()[:16]
+    prefix = INVALID_QUEUE_NAME_CHARS.sub('_', name)
+    prefix = prefix[: QUEUE_NAME_MAX_LENGTH - len(digest) - 1]
+    return f"{prefix}_{digest}"
 
 
 class BmqIncomingMessage(base.RpcIncomingMessage):
@@ -213,6 +239,12 @@ class BmqDriver(base.BaseDriver):
     ):
         super().__init__(conf, url, default_exchange, allowed_remote_exmods)
 
+        # Session is created lazily on first use to avoid connecting
+        # to the broker at import/construction time. Set it first, so that
+        # cleanup() works when __init__ fails.
+        self._session = None
+        self._session_lock = threading.Lock()
+
         # NOTE(arnaud) the BlazingMQ SDK logs every queue operation at INFO,
         # which floods the service logs. Keep its warnings only, unless a
         # level was set for it (e.g. default_log_levels = blazingmq=INFO).
@@ -247,6 +279,13 @@ class BmqDriver(base.BaseDriver):
 
         # e.g. bmq.openstack.priority -> bmq.openstack.broadcast
         self._broadcast_domain = self._domain.replace('priority', 'broadcast')
+        # NOTE(arnaud) the SDK does not return when a queue is opened with
+        # an invalid URI, so refuse an invalid domain here
+        for domain in (self._domain, self._broadcast_domain):
+            if not VALID_DOMAIN.match(domain):
+                raise oslo_messaging.InvalidTransportURL(
+                    url, f'Invalid BlazingMQ domain: {domain!r}'
+                )
 
         # Maps queue URIs to Python queue.Queue objects. When _on_message
         # receives a BlazingMQ message, it looks up the URI here to find
@@ -279,11 +318,6 @@ class BmqDriver(base.BaseDriver):
         self._reply_lock = threading.Lock()
         self._waiters = {}
 
-        # Session is created lazily on first use to avoid connecting
-        # to the broker at import/construction time.
-        self._session = None
-        self._session_lock = threading.Lock()
-
     def _queue_uri(self, target, suffix=None, fanout=False):
         """Return the URI of the queue of a target.
 
@@ -295,10 +329,10 @@ class BmqDriver(base.BaseDriver):
         exchange = target.exchange or self._default_exchange
         name = f"{exchange}.{target.topic}"
         if fanout:
-            return f"bmq://{self._broadcast_domain}/{name}"
+            return f"bmq://{self._broadcast_domain}/{queue_name(name)}"
         if suffix:
             name = f"{name}.{suffix}"
-        return f"bmq://{self._domain}/{name}"
+        return f"bmq://{self._domain}/{queue_name(name)}"
 
     def _get_uri_lock(self, uri):
         """Return a per-URI lock, creating it if needed."""
