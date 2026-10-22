@@ -24,12 +24,17 @@ import oslo_messaging
 from oslo_messaging.tests import utils as test_utils
 
 # blazingmq is a C extension that may not be installed in the test
-# environment. Insert a fake module before importing the driver.
-_fake_bmq = types.ModuleType('blazingmq')
-_fake_bmq.Session = None
-_fake_bmq.Error = Exception
-_fake_bmq.AckStatus = types.SimpleNamespace(SUCCESS='SUCCESS')
-sys.modules.setdefault('blazingmq', _fake_bmq)
+# environment. Insert a fake module before importing the driver, only when
+# it is missing: the tests patch it anyway, and replacing the real one would
+# break the other tests of the process (e.g. the functional tests).
+try:
+    import blazingmq  # noqa: F401
+except ImportError:
+    _fake_bmq = types.ModuleType('blazingmq')
+    _fake_bmq.Session = None
+    _fake_bmq.Error = Exception
+    _fake_bmq.AckStatus = types.SimpleNamespace(SUCCESS='SUCCESS')
+    sys.modules['blazingmq'] = _fake_bmq
 
 from oslo_messaging._drivers import impl_bmq  # noqa: E402
 
