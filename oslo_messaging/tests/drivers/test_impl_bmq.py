@@ -336,7 +336,8 @@ class TestBmqListener(BmqTestBase):
                 'method': 'test',
             }
         ).encode()
-        listener.queue.put((FakeMessage(payload), FakeHandle()))
+        handle = FakeHandle()
+        listener.queue.put((FakeMessage(payload), handle))
 
         results = listener.poll(timeout=1)
         self.assertEqual(1, len(results))
@@ -344,6 +345,10 @@ class TestBmqListener(BmqTestBase):
         self.assertIsInstance(result, impl_bmq.BmqIncomingMessage)
         self.assertEqual({'user': 'admin'}, result.ctxt)
         self.assertEqual({'method': 'test'}, result.message)
+        # confirmed when the server acknowledges it
+        self.assertFalse(handle.confirmed)
+        result.acknowledge()
+        self.assertTrue(handle.confirmed)
 
     def test_poll_timeout(self):
         listener = impl_bmq.BmqListener(
@@ -441,11 +446,42 @@ class TestBmqIncomingMessage(BmqTestBase):
         )
         self.assertEqual(60, msg.client_timeout)
 
-    def test_requeue_noop(self):
+    def test_requeue_posts_a_copy(self):
+        post = mock.Mock()
+        handle = FakeHandle()
         msg = impl_bmq.BmqIncomingMessage(
-            ctxt={}, message={}, reply_q=None, msg_id=None, post=mock.Mock()
+            ctxt={},
+            message={},
+            reply_q=None,
+            msg_id=None,
+            post=post,
+            bmq_message=FakeMessage(b'{"a": 1}', queue_uri='bmq://d/q'),
+            handle=handle,
+        )
+        msg.requeue()
+
+        post.assert_called_once_with('bmq://d/q', b'{"a": 1}', retry=0)
+        self.assertTrue(handle.confirmed)
+
+    def test_requeue_failure_keeps_message(self):
+        handle = FakeHandle()
+        msg = impl_bmq.BmqIncomingMessage(
+            ctxt={},
+            message={},
+            reply_q=None,
+            msg_id=None,
+            post=mock.Mock(side_effect=oslo_messaging.MessageDeliveryFailure),
+            bmq_message=FakeMessage(b'{}'),
+            handle=handle,
         )
         msg.requeue()  # should not raise
+
+        # not confirmed: BlazingMQ delivers it again
+        self.assertFalse(handle.confirmed)
+
+    def test_requeue_supported(self):
+        driver = self._get_driver()
+        driver.require_features(requeue=True)  # should not raise
 
 
 # ---------------------------------------------------------------------------

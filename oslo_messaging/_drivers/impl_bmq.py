@@ -84,18 +84,30 @@ def queue_name(name):
 class BmqIncomingMessage(base.RpcIncomingMessage):
     """A message received from BlazingMQ.
 
-    Wraps a deserialized RPC message with the ability to send a reply
-    back to the caller. The reply is sent via the driver's _post method,
-    which handles queue open/write/close lifecycle. This class does not
-    hold a direct reference to the BlazingMQ session.
+    Wraps a deserialized message with the ability to acknowledge or
+    requeue it, and to send a reply back to the caller of an RPC call.
+    Messages are posted via the driver's _post method. This class does
+    not hold a direct reference to the BlazingMQ session.
     """
 
     def __init__(
-        self, ctxt, message, reply_q, msg_id, post, client_timeout=None
+        self,
+        ctxt,
+        message,
+        reply_q,
+        msg_id,
+        post,
+        client_timeout=None,
+        bmq_message=None,
+        handle=None,
     ):
         super().__init__(ctxt, message, msg_id=msg_id)
         self._reply_q = reply_q
         self._post = post
+        # The message received from BlazingMQ, confirmed by acknowledge()
+        # or requeue()
+        self._bmq_message = bmq_message
+        self._handle = handle
         # The call monitor timeout of the caller: the RPC dispatcher sends
         # heartbeats while the call runs when it is set
         self.client_timeout = client_timeout
@@ -127,13 +139,33 @@ class BmqIncomingMessage(base.RpcIncomingMessage):
         except Exception:
             LOG.exception("Failed to send reply to %s", self._reply_q)
 
-    def requeue(self):
-        """Requeue is not supported by BlazingMQ.
+    def acknowledge(self):
+        """Confirm the message to BlazingMQ, which then deletes it."""
+        if self._handle is None:
+            return
+        try:
+            self._handle.confirm()
+        except Exception:
+            LOG.exception("Failed to confirm the message")
 
-        BlazingMQ handles redelivery internally via its own retry
-        mechanisms. This method is a no-op.
+    def requeue(self):
+        """Give the message back to BlazingMQ, to be delivered again.
+
+        BlazingMQ has no negative acknowledgment: post a copy of the
+        message to its queue, then confirm it. If the copy cannot be
+        posted, the message is not confirmed, and BlazingMQ delivers it
+        again when the listener goes away.
         """
-        LOG.warning("Requeue is not supported by the BlazingMQ driver")
+        if self._handle is None:
+            return
+        try:
+            self._post(
+                self._bmq_message.queue_uri, self._bmq_message.data, retry=0
+            )
+        except Exception:
+            LOG.exception("Failed to requeue the message")
+            return
+        self.acknowledge()
 
     def heartbeat(self):
         """Tell the caller that the call is still running.
@@ -178,8 +210,8 @@ class BmqListener(base.PollStyleListener):
         """Block until a message arrives or timeout expires.
 
         Deserializes the JSON payload, extracts oslo.messaging envelope
-        fields (_context, _reply_q, _msg_id), confirms delivery to
-        BlazingMQ, and returns a BmqIncomingMessage.
+        fields (_context, _reply_q, _msg_id, _timeout), and returns a
+        BmqIncomingMessage.
         """
         if self._stopped.is_set():
             return None
@@ -205,11 +237,18 @@ class BmqListener(base.PollStyleListener):
         msg_id = data.pop('_msg_id', None)
         client_timeout = data.pop('_timeout', None)
 
-        # Confirm delivery to BlazingMQ
-        handle.confirm()
-
+        # The message is confirmed when the server acknowledges it: RPC
+        # servers do before processing it, notification listeners after,
+        # or they requeue it
         return BmqIncomingMessage(
-            ctxt, data, reply_q, msg_id, self._post_fn, client_timeout
+            ctxt,
+            data,
+            reply_q,
+            msg_id,
+            self._post_fn,
+            client_timeout,
+            bmq_message=msg,
+            handle=handle,
         )
 
     def stop(self):
@@ -872,6 +911,9 @@ class BmqDriver(base.BaseDriver):
             call_monitor_timeout,
             retry,
         )
+
+    def require_features(self, requeue=False):
+        """Requeue is supported, see BmqIncomingMessage.requeue()."""
 
     def send_notification(self, target, ctxt, message, version, retry=None):
         """Send a notification message (fire-and-forget, no reply)."""
