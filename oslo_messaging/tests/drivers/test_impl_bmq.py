@@ -253,7 +253,9 @@ class TestOnMessage(BmqTestBase):
 
 class TestBmqListener(BmqTestBase):
     def test_poll_returns_message(self):
-        listener = impl_bmq.BmqListener(post_fn=mock.Mock())
+        listener = impl_bmq.BmqListener(
+            post_fn=mock.Mock(), close_fn=mock.Mock()
+        )
         payload = jsonutils.dumps(
             {
                 '_context': {'user': 'admin'},
@@ -272,18 +274,24 @@ class TestBmqListener(BmqTestBase):
         self.assertEqual({'method': 'test'}, result.message)
 
     def test_poll_timeout(self):
-        listener = impl_bmq.BmqListener(post_fn=mock.Mock())
+        listener = impl_bmq.BmqListener(
+            post_fn=mock.Mock(), close_fn=mock.Mock()
+        )
         results = listener.poll(timeout=0.01)
         self.assertEqual([], results)
 
     def test_stop_unblocks_poll(self):
-        listener = impl_bmq.BmqListener(post_fn=mock.Mock())
+        listener = impl_bmq.BmqListener(
+            post_fn=mock.Mock(), close_fn=mock.Mock()
+        )
         listener.stop()
         results = listener.poll(timeout=1)
         self.assertEqual([], results)
 
     def test_bad_json_skipped(self):
-        listener = impl_bmq.BmqListener(post_fn=mock.Mock())
+        listener = impl_bmq.BmqListener(
+            post_fn=mock.Mock(), close_fn=mock.Mock()
+        )
         handle = FakeHandle()
         listener.queue.put((FakeMessage(b'not json'), handle))
         results = listener.poll(timeout=1)
@@ -551,6 +559,56 @@ class TestListen(BmqTestBase):
             'bmq://bmq.test.priority/notifications.error',
             driver._listener_queues,
         )
+
+    def test_stop_closes_listener_queues(self):
+        driver = self._get_driver()
+        target = oslo_messaging.Target(topic='compute', server='host1')
+        listener = driver.listen(target, batch_size=1, batch_timeout=None)
+        session = driver._get_session()
+
+        listener.start(lambda incoming: None)
+        listener.stop()
+
+        self.assertEqual(
+            sorted(
+                [
+                    'bmq://bmq.test.priority/compute',
+                    'bmq://bmq.test.priority/compute.host1',
+                    'bmq://bmq.test.broadcast/compute',
+                ]
+            ),
+            sorted(session.closed),
+        )
+        self.assertEqual({}, driver._listener_queues)
+        # cleanup after stop does not close them again
+        listener.cleanup()
+        self.assertEqual(3, len(session.closed))
+
+    def test_cleanup_closes_notification_queues(self):
+        driver = self._get_driver()
+        targets = [(oslo_messaging.Target(topic='notifications'), 'info')]
+        listener = driver.listen_for_notifications(
+            targets, pool=None, batch_size=1, batch_timeout=None
+        )
+        listener.cleanup()
+
+        self.assertEqual(
+            ['bmq://bmq.test.priority/notifications.info'],
+            driver._get_session().closed,
+        )
+
+    def test_stop_keeps_queue_of_another_listener(self):
+        driver = self._get_driver()
+        target = oslo_messaging.Target(topic='compute')
+        first = driver.listen(target, batch_size=1, batch_timeout=None)
+        second = driver.listen(target, batch_size=1, batch_timeout=None)
+
+        first.cleanup()
+
+        # the queues now deliver to the second listener
+        self.assertEqual([], driver._get_session().closed)
+        second.cleanup()
+        self.assertEqual(2, len(driver._get_session().closed))
 
     def test_notification_pool_not_supported(self):
         driver = self._get_driver()

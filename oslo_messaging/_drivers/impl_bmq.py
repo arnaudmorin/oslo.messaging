@@ -111,15 +111,19 @@ class BmqListener(base.PollStyleListener):
     BmqIncomingMessage instances to the oslo.messaging server loop.
 
     The listener does not open or close BlazingMQ queues itself — that
-    is done by the driver. It only holds a reference to a thread-safe
-    queue.Queue that the driver populates via _listener_queues.
+    is done by the driver. It holds a thread-safe queue.Queue that the
+    driver populates via _listener_queues, and the URIs of the queues
+    opened for it, which it asks the driver to close when it stops.
     """
 
-    def __init__(self, post_fn):
+    def __init__(self, post_fn, close_fn):
         super().__init__()
         # Public so the driver can register it in _listener_queues
         self.queue = queue.Queue()
+        # URIs of the BlazingMQ queues opened for this listener
+        self.uris = []
         self._post_fn = post_fn
+        self._close_fn = close_fn
         self._stopped = threading.Event()
 
     @base.batch_poll_helper
@@ -159,18 +163,30 @@ class BmqListener(base.PollStyleListener):
         return BmqIncomingMessage(ctxt, data, reply_q, msg_id, self._post_fn)
 
     def stop(self):
-        """Signal the listener to stop polling.
+        """Signal the listener to stop polling and close its queues.
 
         Puts a sentinel (None, None) into the queue to unblock any
-        thread waiting in poll().
+        thread waiting in poll(). Closing the queues stops the delivery
+        to this listener: the broker sends the next messages to the
+        other consumers, and delivers again the messages received but
+        not confirmed yet.
         """
         self._stopped.set()
         # Unblock poll()
         self.queue.put((None, None))
+        self._close_queues()
 
     def cleanup(self):
-        """No-op. Queue cleanup is handled by the driver."""
-        pass
+        """Close the queues of the listener, if stop() did not."""
+        self._close_queues()
+
+    def _close_queues(self):
+        while self.uris:
+            uri = self.uris.pop()
+            try:
+                self._close_fn(uri, self.queue)
+            except Exception:
+                LOG.warning('Failed to close queue %s', uri, exc_info=True)
 
 
 class BmqDriver(base.BaseDriver):
@@ -383,6 +399,24 @@ class BmqDriver(base.BaseDriver):
         self._get_session().open_queue(uri, read=read, write=write)
         with self._queues_lock:
             self._queues[uri] = {'read': read, 'write': write}
+
+    def _add_listener_queue(self, listener, uri):
+        """Open a queue for reading and deliver its messages to listener."""
+        self._open_queue(uri, read=True)
+        with self._listener_lock:
+            self._listener_queues[uri] = listener.queue
+        listener.uris.append(uri)
+
+    def _close_listener_queue(self, uri, listener_queue):
+        """Close a queue opened by _add_listener_queue.
+
+        The queue is only closed if it still delivers to listener_queue:
+        another listener of the driver may have opened it since.
+        """
+        with self._listener_lock:
+            if self._listener_queues.get(uri) is not listener_queue:
+                return
+        self._close_queue(uri)
 
     def _close_queue(self, uri):
         """Close a queue and remove it from all tracking.
@@ -616,28 +650,22 @@ class BmqDriver(base.BaseDriver):
           - broadcast queue: receives fanout messages sent to all servers
             listening on this topic (uses the broadcast domain)
         """
-        listener = BmqListener(self._post)
+        listener = BmqListener(self._post, self._close_listener_queue)
 
         # topic
         uri = f"bmq://{self._domain}/{target.topic}"
-        self._open_queue(uri, read=True)
-        with self._listener_lock:
-            self._listener_queues[uri] = listener.queue
+        self._add_listener_queue(listener, uri)
         LOG.info("Starting listener on %s", uri)
 
         # topic.server
         if target.server:
             uri = f"bmq://{self._domain}/{target.topic}.{target.server}"
-            self._open_queue(uri, read=True)
-            with self._listener_lock:
-                self._listener_queues[uri] = listener.queue
+            self._add_listener_queue(listener, uri)
             LOG.info("Starting listener on %s", uri)
 
         # fanout
         uri = f"bmq://{self._broadcast_domain}/{target.topic}"
-        self._open_queue(uri, read=True)
-        with self._listener_lock:
-            self._listener_queues[uri] = listener.queue
+        self._add_listener_queue(listener, uri)
         LOG.info("Starting listener on %s", uri)
 
         return base.PollStyleListenerAdapter(
@@ -660,13 +688,11 @@ class BmqDriver(base.BaseDriver):
                 "Notification pools are not supported by the BlazingMQ driver"
             )
 
-        listener = BmqListener(self._post)
+        listener = BmqListener(self._post, self._close_listener_queue)
 
         for target, priority in targets_and_priorities:
             uri = f"bmq://{self._domain}/{target.topic}.{priority}"
-            self._open_queue(uri, read=True)
-            with self._listener_lock:
-                self._listener_queues[uri] = listener.queue
+            self._add_listener_queue(listener, uri)
             LOG.info("Starting listener for notifications on %s", uri)
 
         return base.PollStyleListenerAdapter(
