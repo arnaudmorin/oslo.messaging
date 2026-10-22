@@ -18,6 +18,7 @@ import logging as std_logging
 import queue
 import re
 import threading
+import time
 import uuid
 
 from oslo_config import cfg
@@ -48,6 +49,8 @@ NORMAL_SESSION_EVENTS = (
 
 DEFAULT_DOMAIN = 'bmq.openstack.priority'
 DEFAULT_PORT = 30114
+# Maximum delay between two attempts to post a message, in seconds
+MAX_RETRY_DELAY = 5
 
 # Queue names are limited by BlazingMQ to 64 characters, among letters,
 # digits, '-', '_' and '.' (see bmqt::Uri)
@@ -381,12 +384,20 @@ class BmqDriver(base.BaseDriver):
         if self._session is None:
             with self._session_lock:
                 if self._session is None:
-                    self._session = blazingmq.Session(
-                        self._on_session_event,
-                        on_message=self._on_message,
-                        broker=self._broker,
-                        **self._security_kwargs(),
-                    )
+                    try:
+                        self._session = blazingmq.Session(
+                            self._on_session_event,
+                            on_message=self._on_message,
+                            broker=self._broker,
+                            **self._security_kwargs(),
+                        )
+                    except Exception as e:
+                        # e.g. BrokerTimeoutError, when the broker is not
+                        # reachable or refuses the credentials
+                        raise oslo_messaging.MessageDeliveryFailure(
+                            f"Failed to connect to the BlazingMQ broker "
+                            f"{self._broker}: {e}"
+                        ) from e
                     LOG.info(
                         "BlazingMQ session created: broker=%s domain=%s",
                         self._broker,
@@ -498,10 +509,19 @@ class BmqDriver(base.BaseDriver):
             if existing:
                 need_close = True
 
-        if need_close:
-            self._get_session().close_queue(uri)
-        LOG.debug('Opening queue uri=%s read=%s write=%s', uri, read, write)
-        self._get_session().open_queue(uri, read=read, write=write)
+        try:
+            if need_close:
+                self._get_session().close_queue(uri)
+            LOG.debug(
+                'Opening queue uri=%s read=%s write=%s', uri, read, write
+            )
+            self._get_session().open_queue(uri, read=read, write=write)
+        except blazingmq.Error as e:
+            with self._queues_lock:
+                self._queues.pop(uri, None)
+            raise oslo_messaging.MessageDeliveryFailure(
+                f"Failed to open the BlazingMQ queue {uri}: {e}"
+            ) from e
         with self._queues_lock:
             self._queues[uri] = {'read': read, 'write': write}
 
@@ -539,7 +559,12 @@ class BmqDriver(base.BaseDriver):
                 return
             del self._queues[uri]
         LOG.debug('Closing queue uri=%s', uri)
-        self._get_session().close_queue(uri)
+        try:
+            self._get_session().close_queue(uri)
+        except (blazingmq.Error, oslo_messaging.MessageDeliveryFailure):
+            # The queue is not used anymore, the broker closes it with the
+            # session at the latest
+            LOG.warning('Failed to close queue %s', uri, exc_info=True)
         # Clean up the per-URI lock since the queue is gone
         with self._uri_locks_lock:
             self._uri_locks.pop(uri, None)
@@ -600,9 +625,16 @@ class BmqDriver(base.BaseDriver):
                                 on_ack, ack_status, ack_event
                             ),
                         )
-                    except blazingmq.Error as e:
+                    except (
+                        blazingmq.Error,
+                        oslo_messaging.MessageDeliveryFailure,
+                    ) as e:
                         if max_attempts and attempt >= max_attempts:
                             raise oslo_messaging.MessageDeliveryFailure(str(e))
+                        LOG.warning(
+                            'Failed to post to %s, retrying: %s', uri, e
+                        )
+                        time.sleep(min(attempt, MAX_RETRY_DELAY))
                         continue
 
                     # Wait for broker acknowledgment
@@ -619,6 +651,12 @@ class BmqDriver(base.BaseDriver):
                                     ack_status.get('status')
                                 )
                             )
+                        LOG.warning(
+                            'Post to %s failed with status %s, retrying',
+                            uri,
+                            ack_status.get('status'),
+                        )
+                        time.sleep(min(attempt, MAX_RETRY_DELAY))
                         continue
 
                     # Message delivered successfully
@@ -626,7 +664,12 @@ class BmqDriver(base.BaseDriver):
             finally:
                 # Always restore the queue's previous flags
                 if previous:
-                    self._open_queue(uri, **previous)
+                    try:
+                        self._open_queue(uri, **previous)
+                    except oslo_messaging.MessageDeliveryFailure:
+                        LOG.warning(
+                            'Failed to reopen queue %s', uri, exc_info=True
+                        )
                 else:
                     self._close_queue(uri)
 

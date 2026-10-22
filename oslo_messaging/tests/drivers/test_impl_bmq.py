@@ -20,6 +20,7 @@ import time
 import types
 from unittest import mock
 
+import fixtures
 from oslo_serialization import jsonutils
 
 import oslo_messaging
@@ -857,6 +858,77 @@ class TestListen(BmqTestBase):
             pool='mypool',
             batch_size=1,
             batch_timeout=None,
+        )
+
+
+class SdkError(Exception):
+    """Stands for blazingmq.Error."""
+
+
+class TestErrors(BmqTestBase):
+    def setUp(self):
+        super().setUp()
+        self.mock_bmq.Error = SdkError
+        # do not wait between the attempts
+        self.useFixture(fixtures.MockPatch('time.sleep'))
+
+    def test_connection_failure(self):
+        driver = self._get_driver()
+        self.mock_bmq.Session = mock.Mock(side_effect=SdkError('timeout'))
+        self.assertRaisesRegex(
+            oslo_messaging.MessageDeliveryFailure,
+            'Failed to connect to the BlazingMQ broker',
+            driver.listen,
+            oslo_messaging.Target(topic='compute', server='host1'),
+            1,
+            None,
+        )
+
+    def test_open_queue_failure(self):
+        driver = self._get_driver()
+        session = driver._get_session()
+        session.open_queue = mock.Mock(side_effect=SdkError('refused'))
+        self.assertRaisesRegex(
+            oslo_messaging.MessageDeliveryFailure,
+            'Failed to open the BlazingMQ queue',
+            driver.listen,
+            oslo_messaging.Target(topic='compute', server='host1'),
+            1,
+            None,
+        )
+        self.assertEqual({}, driver._queues)
+
+    def _cast_with_failures(self, failures, retry):
+        driver = self._get_driver()
+        session = driver._get_session()
+        orig_post = session.post
+        calls = []
+
+        def post(uri, payload, on_ack=None, **kw):
+            calls.append(uri)
+            if len(calls) <= failures:
+                raise SdkError('not connected')
+            orig_post(uri, payload, on_ack=on_ack, **kw)
+
+        session.post = post
+        driver.send(
+            oslo_messaging.Target(topic='compute'),
+            {},
+            {},
+            wait_for_reply=False,
+            retry=retry,
+        )
+        return calls
+
+    def test_post_retried(self):
+        self.assertEqual(3, len(self._cast_with_failures(2, retry=None)))
+
+    def test_post_not_retried(self):
+        self.assertRaises(
+            oslo_messaging.MessageDeliveryFailure,
+            self._cast_with_failures,
+            1,
+            retry=0,
         )
 
 
