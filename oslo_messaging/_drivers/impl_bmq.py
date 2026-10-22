@@ -650,6 +650,16 @@ class BmqDriver(base.BaseDriver):
             self._post(uri, payload, retry=retry, timeout=timeout)
             return None
 
+        # The timeout covers the whole call: the broker ack of the request,
+        # then the reply
+        timer = rpc_common.DecayingTimer(duration=timeout)
+        timer.start()
+
+        def timed_out():
+            raise oslo_messaging.MessagingTimeout(
+                f"Timeout waiting for reply on {target.topic}"
+            )
+
         # The reply is sent to the reply queue of the driver, with the id
         # of the call, which routes it to this waiter
         msg_id = uuid.uuid4().hex
@@ -659,13 +669,11 @@ class BmqDriver(base.BaseDriver):
         self._waiters[msg_id] = waiter
         try:
             payload = jsonutils.dumps(message).encode()
-            self._post(uri, payload, retry=retry, timeout=timeout)
+            self._post(uri, payload, retry=retry, timeout=timer.check_return())
             try:
-                data = waiter.get(timeout=timeout)
+                data = waiter.get(timeout=timer.check_return(timed_out))
             except queue.Empty:
-                raise oslo_messaging.MessagingTimeout(
-                    f"Timeout waiting for reply on {target.topic}"
-                )
+                timed_out()
         finally:
             del self._waiters[msg_id]
 
