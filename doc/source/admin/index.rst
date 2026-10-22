@@ -6,5 +6,6 @@ Deployment Guide
    :maxdepth: 2
 
    drivers
+   bmq
    kafka
    rabbit
