@@ -15,6 +15,8 @@
 import logging
 import queue
 import sys
+import threading
+import time
 import types
 from unittest import mock
 
@@ -549,6 +551,32 @@ class TestSendCall(BmqTestBase):
             timeout=0.1,
         )
         self.assertEqual({}, driver._waiters)
+
+    def test_call_timeout_covers_ack_and_reply(self):
+        driver = self._get_driver()
+        session = driver._get_session()
+
+        # the broker acks after 0.3s, the reply comes 0.3s later: each
+        # step is shorter than the timeout, but not the call
+        def post(uri, payload, on_ack=None, **kw):
+            request = jsonutils.loads(payload)
+            time.sleep(0.3)
+            on_ack(FakeAck(status='SUCCESS'))
+            threading.Timer(
+                0.3, self._reply_to, (driver, request), {'_reply': 'late'}
+            ).start()
+
+        session.post = post
+        target = oslo_messaging.Target(topic='conductor')
+        self.assertRaises(
+            oslo_messaging.MessagingTimeout,
+            driver.send,
+            target,
+            {},
+            {},
+            wait_for_reply=True,
+            timeout=0.5,
+        )
 
     def test_call_raises_original_exception(self):
         exc = ValueError('bad')
