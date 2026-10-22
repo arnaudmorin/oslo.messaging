@@ -427,10 +427,10 @@ class TestSendCall(BmqTestBase):
                 ctxt={},
                 message={},
                 reply_q=request['_reply_q'],
-                msg_id='msg-1',
-                post=lambda reply_uri, data: driver._listener_queues[
-                    reply_uri
-                ].put((FakeMessage(data), FakeHandle())),
+                msg_id=request['_msg_id'],
+                post=lambda reply_uri, data: driver._on_message(
+                    FakeMessage(data, queue_uri=reply_uri), FakeHandle()
+                ),
             )
             reply.reply(failure=failure_info)
 
@@ -440,6 +440,81 @@ class TestSendCall(BmqTestBase):
             target, {}, {'method': 'x'}, wait_for_reply=True, timeout=5
         )
 
+    def _reply_to(self, driver, request, **body):
+        body['_msg_id'] = request['_msg_id']
+        driver._on_message(
+            FakeMessage(
+                jsonutils.dumps(body).encode(), queue_uri=request['_reply_q']
+            ),
+            FakeHandle(),
+        )
+
+    def test_calls_share_the_reply_queue(self):
+        driver = self._get_driver()
+        session = driver._get_session()
+        orig_post = session.post
+        requests = []
+
+        def post(uri, payload, on_ack=None, **kw):
+            orig_post(uri, payload, on_ack=on_ack, **kw)
+            request = jsonutils.loads(payload)
+            requests.append(request)
+            self._reply_to(driver, request, _reply=request['n'])
+
+        session.post = post
+        target = oslo_messaging.Target(topic='conductor')
+        for n in range(3):
+            self.assertEqual(
+                n,
+                driver.send(
+                    target, {}, {'n': n}, wait_for_reply=True, timeout=5
+                ),
+            )
+
+        reply_queues = {r['_reply_q'] for r in requests}
+        self.assertEqual(1, len(reply_queues))
+        self.assertEqual(3, len({r['_msg_id'] for r in requests}))
+        # the reply queue is opened once, and stays open
+        reply_uri = reply_queues.pop()
+        self.assertEqual(
+            1, len([o for o in session.opened if o[0] == reply_uri])
+        )
+        self.assertNotIn(reply_uri, session.closed)
+        self.assertEqual({}, driver._waiters)
+
+    def test_reply_of_another_call_is_dropped(self):
+        driver = self._get_driver()
+        session = driver._get_session()
+        orig_post = session.post
+
+        def post(uri, payload, on_ack=None, **kw):
+            orig_post(uri, payload, on_ack=on_ack, **kw)
+            request = jsonutils.loads(payload)
+            # a late reply of a previous call, then the reply of this one
+            self._reply_to(driver, dict(request, _msg_id='old'), _reply='late')
+            self._reply_to(driver, request, _reply='mine')
+
+        session.post = post
+        target = oslo_messaging.Target(topic='conductor')
+        self.assertEqual(
+            'mine',
+            driver.send(target, {}, {}, wait_for_reply=True, timeout=5),
+        )
+
+    def test_call_timeout(self):
+        driver = self._get_driver()
+        target = oslo_messaging.Target(topic='conductor')
+        self.assertRaises(
+            oslo_messaging.MessagingTimeout,
+            driver.send,
+            target,
+            {},
+            {},
+            wait_for_reply=True,
+            timeout=0.1,
+        )
+        self.assertEqual({}, driver._waiters)
+
     def test_call_raises_original_exception(self):
         exc = ValueError('bad')
         self.assertRaisesRegex(
@@ -448,8 +523,9 @@ class TestSendCall(BmqTestBase):
 
     def test_call_raises_allowed_exception(self):
         exc = oslo_messaging.MessagingTimeout('slow')
-        self.assertRaises(
+        self.assertRaisesRegex(
             oslo_messaging.MessagingTimeout,
+            'slow',
             self._call,
             (type(exc), exc, None),
             ['oslo_messaging.exceptions'],

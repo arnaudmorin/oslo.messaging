@@ -273,6 +273,12 @@ class BmqDriver(base.BaseDriver):
         self._uri_locks = {}
         self._uri_locks_lock = threading.Lock()
 
+        # RPC replies: a single reply queue for the driver, opened on the
+        # first call, and the calls waiting for a reply, by message id
+        self._reply_uri = None
+        self._reply_lock = threading.Lock()
+        self._waiters = {}
+
         # Session is created lazily on first use to avoid connecting
         # to the broker at import/construction time.
         self._session = None
@@ -362,6 +368,9 @@ class BmqDriver(base.BaseDriver):
         method calls except confirm(), to avoid BlazingMQ deadlocks.
         """
         LOG.debug("Received message on %s", msg.queue_uri)
+        if msg.queue_uri == self._reply_uri:
+            self._on_reply(msg, msg_handle)
+            return
         with self._listener_lock:
             # Dispatch the message to the correct queue
             q = self._listener_queues.get(msg.queue_uri)
@@ -373,6 +382,35 @@ class BmqDriver(base.BaseDriver):
                 msg.queue_uri,
             )
             msg_handle.confirm()
+
+    def _on_reply(self, msg, msg_handle):
+        """Hand an RPC reply to the call waiting for it.
+
+        Called from _on_message, on a thread of the SDK. Replies of calls
+        which are not waiting anymore (e.g. timed out) are dropped.
+        """
+        msg_handle.confirm()
+        try:
+            data = jsonutils.loads(msg.data)
+        except Exception:
+            LOG.exception("Failed to deserialize BlazingMQ reply")
+            return
+        msg_id = data.get('_msg_id')
+        waiter = self._waiters.get(msg_id)
+        if waiter is None:
+            LOG.debug("No call waiting for reply %s, dropping it", msg_id)
+            return
+        waiter.put(data)
+
+    def _get_reply_uri(self):
+        """Return the reply queue of the driver, opening it on first use."""
+        if self._reply_uri is None:
+            with self._reply_lock:
+                if self._reply_uri is None:
+                    uri = f"bmq://{self._domain}/reply.{uuid.uuid4().hex}"
+                    self._open_queue(uri, read=True)
+                    self._reply_uri = uri
+        return self._reply_uri
 
     def _open_queue(self, uri, read=False, write=False):
         """Open or reopen a queue with the requested flags.
@@ -559,9 +597,9 @@ class BmqDriver(base.BaseDriver):
         """Core send implementation for both RPC calls and casts.
 
         For casts (wait_for_reply=False): posts the message and returns.
-        For calls (wait_for_reply=True): creates a temporary reply queue,
-        posts the message with the reply URI embedded, then blocks until
-        a reply arrives or timeout expires.
+        For calls (wait_for_reply=True): posts the message with the reply
+        queue of the driver and the id of the call, then blocks until
+        the reply arrives or timeout expires.
         """
         # Determine destination queue URI
         if target.fanout:
@@ -573,45 +611,29 @@ class BmqDriver(base.BaseDriver):
         if ctxt:
             message['_context'] = self._context_packing(ctxt)
 
-        # Set up reply queue
-        reply_uri = None
-        reply_q = None
-        if wait_for_reply:
-            reply_uri = f"bmq://{self._domain}/reply.{uuid.uuid4().hex}"
-            reply_q = queue.Queue()
-            self._open_queue(reply_uri, read=True)
-            with self._listener_lock:
-                self._listener_queues[reply_uri] = reply_q
-            message['_reply_q'] = reply_uri
-
-        payload = jsonutils.dumps(message).encode()
-
-        try:
-            self._post(uri, payload, retry=retry, timeout=timeout)
-        except Exception:
-            self._close_queue(reply_uri)
-            raise
-
         if not wait_for_reply:
+            payload = jsonutils.dumps(message).encode()
+            self._post(uri, payload, retry=retry, timeout=timeout)
             return None
 
-        # Wait for reply on per-call queue
+        # The reply is sent to the reply queue of the driver, with the id
+        # of the call, which routes it to this waiter
+        msg_id = uuid.uuid4().hex
+        message['_msg_id'] = msg_id
+        message['_reply_q'] = self._get_reply_uri()
+        waiter = queue.Queue()
+        self._waiters[msg_id] = waiter
         try:
-            msg, handle = reply_q.get(timeout=timeout)
-        except queue.Empty:
-            self._close_queue(reply_uri)
-            raise oslo_messaging.MessagingTimeout(
-                f"Timeout waiting for reply on {target.topic}"
-            )
-
-        handle.confirm()
-        self._close_queue(reply_uri)
-
-        try:
-            data = jsonutils.loads(msg.data)
-        except Exception:
-            LOG.exception("Failed to deserialize reply")
-            return None
+            payload = jsonutils.dumps(message).encode()
+            self._post(uri, payload, retry=retry, timeout=timeout)
+            try:
+                data = waiter.get(timeout=timeout)
+            except queue.Empty:
+                raise oslo_messaging.MessagingTimeout(
+                    f"Timeout waiting for reply on {target.topic}"
+                )
+        finally:
+            del self._waiters[msg_id]
 
         if data.get('_failure'):
             # NOTE(arnaud) callers rely on the original exception class
@@ -728,6 +750,7 @@ class BmqDriver(base.BaseDriver):
         except Exception:
             LOG.debug('Failed to stop the BlazingMQ session', exc_info=True)
         self._session = None
+        self._reply_uri = None
         self._queues.clear()
         self._listener_queues.clear()
         self._uri_locks.clear()
