@@ -25,6 +25,7 @@ import fixtures
 from oslo_serialization import jsonutils
 
 import oslo_messaging
+from oslo_messaging._drivers import bmq_options
 from oslo_messaging.tests import utils as test_utils
 
 # blazingmq is a C extension that may not be installed in the test
@@ -107,6 +108,11 @@ class BmqTestBase(test_utils.BaseTestCase):
         self.mock_bmq.Error = Exception
         self.mock_bmq.AckStatus.SUCCESS = 'SUCCESS'
         self.addCleanup(patcher.stop)
+        # the driver registers its options, register them before, so the
+        # tests can set them
+        self.conf.register_opts(
+            bmq_options.BMQ_OPTS, group='oslo_messaging_bmq'
+        )
 
     def _get_driver(self, url='bmq://host:30114/bmq.test.priority'):
         transport = oslo_messaging.get_rpc_transport(self.conf, url=url)
