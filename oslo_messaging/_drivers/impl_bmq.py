@@ -158,6 +158,15 @@ class BmqIncomingMessage(base.RpcIncomingMessage):
         """
         if self._handle is None:
             return
+        if '?id=' in self._bmq_message.queue_uri:
+            # NOTE(arnaud) a copy posted to the queue of a pool would be
+            # delivered to every pool again: leave it unconfirmed instead
+            LOG.warning(
+                "Requeue is not supported by the notification pools, the "
+                "message of %s is delivered again when the listener stops",
+                self._bmq_message.queue_uri,
+            )
+            return
         try:
             self._post(
                 self._bmq_message.queue_uri, self._bmq_message.data, retry=0
@@ -331,6 +340,8 @@ class BmqDriver(base.BaseDriver):
         conf.register_group(opt_group)
         conf.register_opts(bmq_options.BMQ_OPTS, group=opt_group)
         self._ssl_ca_file = conf.oslo_messaging_bmq.ssl_ca_file
+        # The fanout domain of the notification pools, if any
+        self._pool_domain = conf.oslo_messaging_bmq.pool_domain or None
 
         # Parse broker address (and credentials) from URL
         self._credentials = None
@@ -354,8 +365,12 @@ class BmqDriver(base.BaseDriver):
         self._broadcast_domain = self._domain.replace('priority', 'broadcast')
         # NOTE(arnaud) the SDK does not return when a queue is opened with
         # an invalid URI, so refuse an invalid domain here
-        for domain in (self._domain, self._broadcast_domain):
-            if not VALID_DOMAIN.match(domain):
+        for domain in (
+            self._domain,
+            self._broadcast_domain,
+            self._pool_domain,
+        ):
+            if domain is not None and not VALID_DOMAIN.match(domain):
                 raise oslo_messaging.InvalidTransportURL(
                     url, f'Invalid BlazingMQ domain: {domain!r}'
                 )
@@ -390,13 +405,14 @@ class BmqDriver(base.BaseDriver):
         self._reply_lock = threading.Lock()
         self._waiters = {}
 
-    def _queue_uri(self, target, suffix=None, fanout=False):
+    def _queue_uri(self, target, suffix=None, fanout=False, domain=None):
         """Return the URI of the queue of a target.
 
         The queue name is <exchange>.<topic>[.<suffix>], the suffix being
         the server of an RPC target or the priority of a notification.
         It starts with the exchange, as services use topics with the same
-        name in different exchanges (e.g. notifications).
+        name in different exchanges (e.g. notifications). The queue is in
+        the domain of the transport URL, unless another domain is given.
         """
         exchange = target.exchange or self._default_exchange
         name = f"{exchange}.{target.topic}"
@@ -404,7 +420,7 @@ class BmqDriver(base.BaseDriver):
             return f"bmq://{self._broadcast_domain}/{queue_name(name)}"
         if suffix:
             name = f"{name}.{suffix}"
-        return f"bmq://{self._domain}/{queue_name(name)}"
+        return f"bmq://{domain or self._domain}/{queue_name(name)}"
 
     def _get_uri_lock(self, uri):
         """Return a per-URI lock, creating it if needed."""
@@ -916,8 +932,19 @@ class BmqDriver(base.BaseDriver):
         """Requeue is supported, see BmqIncomingMessage.requeue()."""
 
     def send_notification(self, target, ctxt, message, version, retry=None):
-        """Send a notification message (fire-and-forget, no reply)."""
+        """Send a notification message (fire-and-forget, no reply).
+
+        With a pool domain, the notification is also posted to it, for the
+        listener pools: BlazingMQ delivers a copy to each pool.
+        """
         self._send(target, ctxt, message, retry=retry)
+        if self._pool_domain:
+            # message holds the context packed by _send
+            self._post(
+                self._queue_uri(target, domain=self._pool_domain),
+                jsonutils.dumps(message).encode(),
+                retry=retry,
+            )
 
     def listen(self, target, batch_size, batch_timeout):
         """Create a listener for RPC messages on the given target.
@@ -961,17 +988,33 @@ class BmqDriver(base.BaseDriver):
         notifications.info and notifications.error would each get their
         own queue. All queues feed into a single BmqListener.
 
-        Notification pools are not supported by the BlazingMQ driver.
+        The listeners of a pool consume the copy of the notifications of
+        the pool domain, with the name of the pool as app id: BlazingMQ
+        delivers a copy of each notification to each pool, and shares it
+        between the listeners of the pool.
         """
         if pool is not None:
-            raise NotImplementedError(
-                "Notification pools are not supported by the BlazingMQ driver"
-            )
+            if not self._pool_domain:
+                raise NotImplementedError(
+                    "Notification pools require a pool domain "
+                    "([oslo_messaging_bmq] pool_domain)"
+                )
+            if INVALID_QUEUE_NAME_CHARS.search(pool):
+                raise ValueError(
+                    f"Invalid notification pool name: {pool!r}, only "
+                    f"letters, digits, '-', '_' and '.' are allowed"
+                )
 
         listener = BmqListener(self._post, self._close_listener_queue)
 
         for target, priority in targets_and_priorities:
-            uri = self._queue_uri(target, priority)
+            if pool is None:
+                uri = self._queue_uri(target, priority)
+            else:
+                uri = self._queue_uri(
+                    target, priority, domain=self._pool_domain
+                )
+                uri = f"{uri}?id={pool}"
             self._add_listener_queue(listener, uri)
             LOG.info("Starting listener for notifications on %s", uri)
 

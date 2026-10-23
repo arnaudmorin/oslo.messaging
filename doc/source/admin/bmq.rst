@@ -35,6 +35,9 @@ The driver uses two domains, which must be configured on the broker:
   is the name of the priority domain, with ``priority`` replaced by
   ``broadcast``, for example ``bmq.openstack.broadcast``.
 
+A third domain, in *fanout* mode, is needed for the notification listener
+pools only, see `Notification Pools`_.
+
 Queues
 ~~~~~~
 
@@ -50,6 +53,7 @@ RPC to a server       ``bmq://<priority domain>/<exchange>.<topic>.<server>``
 RPC fanout            ``bmq://<broadcast domain>/<exchange>.<topic>``
 RPC replies           ``bmq://<priority domain>/reply.<id>``
 Notification          ``bmq://<priority domain>/<exchange>.<topic>.<priority>``
+Notification pool     ``bmq://<pool domain>/<exchange>.<topic>.<priority>?id=<pool>``
 ====================  ===========================================
 
 BlazingMQ limits queue names to 64 characters, among letters, digits,
@@ -78,8 +82,11 @@ The broker drops the messages which are not consumed within the
 Limitations
 ~~~~~~~~~~~
 
-* Notification listener pools are not supported: listeners with a
-  ``pool`` raise ``NotImplementedError``.
+* Notification listener pools need a domain in fanout mode, which lists
+  the names of the pools, see `Notification Pools`_. Without it, listeners
+  with a ``pool`` raise ``NotImplementedError``. Requeue is not supported
+  by the pools: a requeued notification stays with its listener, and is
+  delivered again when the listener stops.
 * Only the first host of the transport URL is used. High availability is
   provided by the BlazingMQ cluster, through a proxy or a load balancer in
   front of its brokers.
@@ -140,6 +147,29 @@ consumers connected when they are posted, its storage can be in memory
 Choose ``messageTtl`` with the longest time the messages may wait for a
 consumer, for example the notifications while their consumer is down.
 
+Notification Pools
+~~~~~~~~~~~~~~~~~~
+
+Each pool of notification listeners gets a copy of every notification,
+shared between the listeners of the pool. The driver relies on a domain in
+*fanout* mode for them, set with
+:oslo.config:option:`oslo_messaging_bmq.pool_domain`, on the services which
+send the notifications and on the listeners. The notifications are then
+also posted to this domain, and BlazingMQ keeps a copy of each of them for
+each *app id* of the domain: the listeners of a pool consume the copies of
+the app id named after the pool.
+
+The domain must list the names of all the pools in its ``appIDs``, for
+example for the pools ``pool-a`` and ``pool-b``:
+
+.. code-block:: json
+
+    "mode": {"fanout": {"appIDs": ["pool-a", "pool-b"]}}
+
+The listeners of a pool which is not in the list receive nothing, and the
+copies of a pool without listeners wait for them until ``messageTtl``. The
+other parameters of the domain are the same as the priority domain.
+
 Authentication
 ~~~~~~~~~~~~~~
 
@@ -190,6 +220,8 @@ For example, to use the driver for RPC and notifications::
 
     [oslo_messaging_bmq]
     ssl_ca_file = /etc/ssl/certs/bmq-ca.pem
+    # only with notification listener pools
+    pool_domain = bmq.openstack.fanout
 
 Driver Options
 ~~~~~~~~~~~~~~
@@ -199,6 +231,7 @@ The configuration options are in the
 configuration file:
 
 - :oslo.config:option:`oslo_messaging_bmq.ssl_ca_file`
+- :oslo.config:option:`oslo_messaging_bmq.pool_domain`
 
 Logging
 ~~~~~~~

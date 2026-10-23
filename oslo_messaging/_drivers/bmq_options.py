@@ -24,4 +24,13 @@ BMQ_OPTS = [
         'broker must listen with TLS. Requires a blazingmq SDK with TLS '
         'support.',
     ),
+    cfg.StrOpt(
+        'pool_domain',
+        default='',
+        help='Domain, in fanout mode, for the notification listener pools. '
+        'When set, the notifications are also posted to this domain, where '
+        'the listeners of a pool consume them, with the name of the pool as '
+        'app id: the domain must list the names of the pools in its '
+        'appIDs. When not set, listeners with a pool are not supported.',
+    ),
 ]

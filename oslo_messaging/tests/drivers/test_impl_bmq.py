@@ -142,6 +142,14 @@ class TestTransportURL(BmqTestBase):
             'bmq.test.broadcast',
         )
 
+    def test_invalid_pool_domain(self):
+        self.config(pool_domain='bmq..fanout', group='oslo_messaging_bmq')
+        self.assertRaises(
+            oslo_messaging.InvalidTransportURL,
+            self._get_driver,
+            'bmq://host:30114/bmq.test.priority',
+        )
+
     def test_invalid_domain(self):
         self.assertRaises(
             oslo_messaging.InvalidTransportURL,
@@ -477,6 +485,24 @@ class TestBmqIncomingMessage(BmqTestBase):
         msg.requeue()  # should not raise
 
         # not confirmed: BlazingMQ delivers it again
+        self.assertFalse(handle.confirmed)
+
+    def test_requeue_of_pool_keeps_message(self):
+        post = mock.Mock()
+        handle = FakeHandle()
+        msg = impl_bmq.BmqIncomingMessage(
+            ctxt={},
+            message={},
+            reply_q=None,
+            msg_id=None,
+            post=post,
+            bmq_message=FakeMessage(b'{}', queue_uri='bmq://f/q?id=pool'),
+            handle=handle,
+        )
+        msg.requeue()
+
+        # a copy would be delivered to all the pools again
+        post.assert_not_called()
         self.assertFalse(handle.confirmed)
 
     def test_requeue_supported(self):
@@ -980,7 +1006,7 @@ class TestListen(BmqTestBase):
         second.cleanup()
         self.assertEqual(2, len(driver._get_session().closed))
 
-    def test_notification_pool_not_supported(self):
+    def test_notification_pool_needs_pool_domain(self):
         driver = self._get_driver()
         targets = [(oslo_messaging.Target(topic='t'), 'info')]
         self.assertRaises(
@@ -991,6 +1017,79 @@ class TestListen(BmqTestBase):
             batch_size=1,
             batch_timeout=None,
         )
+
+    def test_notification_pool(self):
+        self.config(pool_domain='bmq.test.fanout', group='oslo_messaging_bmq')
+        driver = self._get_driver()
+        targets = [(oslo_messaging.Target(topic='notifications'), 'info')]
+        driver.listen_for_notifications(
+            targets, pool='mypool', batch_size=1, batch_timeout=None
+        )
+
+        self.assertEqual(
+            ['bmq://bmq.test.fanout/openstack.notifications.info?id=mypool'],
+            list(driver._listener_queues),
+        )
+
+    def test_invalid_notification_pool(self):
+        self.config(pool_domain='bmq.test.fanout', group='oslo_messaging_bmq')
+        driver = self._get_driver()
+        targets = [(oslo_messaging.Target(topic='t'), 'info')]
+        self.assertRaises(
+            ValueError,
+            driver.listen_for_notifications,
+            targets,
+            pool='my pool',
+            batch_size=1,
+            batch_timeout=None,
+        )
+
+
+class TestSendNotification(BmqTestBase):
+    def _notify(self):
+        driver = self._get_driver()
+        target = oslo_messaging.Target(topic='notifications.info')
+        driver.send_notification(
+            target, {'user': 'admin'}, {'event_type': 'x'}, 2.0
+        )
+        return driver._get_producer().posted
+
+    def test_notification(self):
+        posted = self._notify()
+
+        self.assertEqual(
+            ['bmq://bmq.test.priority/openstack.notifications.info'],
+            [uri for uri, _, _ in posted],
+        )
+
+    def test_notification_with_pool_domain(self):
+        self.config(pool_domain='bmq.test.fanout', group='oslo_messaging_bmq')
+        posted = self._notify()
+
+        self.assertEqual(
+            [
+                'bmq://bmq.test.priority/openstack.notifications.info',
+                'bmq://bmq.test.fanout/openstack.notifications.info',
+            ],
+            [uri for uri, _, _ in posted],
+        )
+        # the same message, with its context
+        self.assertEqual(posted[0][1], posted[1][1])
+        self.assertEqual(
+            {'user': 'admin'}, jsonutils.loads(posted[1][1])['_context']
+        )
+
+    def test_rpc_not_posted_to_pool_domain(self):
+        self.config(pool_domain='bmq.test.fanout', group='oslo_messaging_bmq')
+        driver = self._get_driver()
+        driver.send(
+            oslo_messaging.Target(topic='compute'),
+            {},
+            {'method': 'x'},
+            wait_for_reply=False,
+        )
+
+        self.assertEqual(1, len(driver._get_producer().posted))
 
 
 class SdkError(Exception):
