@@ -87,9 +87,10 @@ Limitations
   with a ``pool`` raise ``NotImplementedError``. Requeue is not supported
   by the pools: a requeued notification stays with its listener, and is
   delivered again when the listener stops.
-* Only the first host of the transport URL is used. High availability is
-  provided by the BlazingMQ cluster, through a proxy or a load balancer in
-  front of its brokers.
+* With several hosts in the transport URL, the driver connects to the
+  first one which accepts the connection. Once connected, it reconnects to
+  the same host: high availability is provided by the BlazingMQ cluster,
+  through a proxy or a load balancer in front of its brokers.
 * The driver uses native threads, from the SDK: services must use the
   threading executor, eventlet is not supported.
 
@@ -213,6 +214,9 @@ The transport URL is of the form::
     bmq://[user:password@]host[:port]/domain
 
 The port defaults to 30114, and the domain to ``bmq.openstack.priority``.
+Several hosts can be given, separated by commas, each with its own
+credentials: they are tried in turn, and a host which is down delays the
+connection by :oslo.config:option:`oslo_messaging_bmq.connect_timeout`.
 For example, to use the driver for RPC and notifications::
 
     [DEFAULT]
@@ -231,6 +235,7 @@ The configuration options are in the
 configuration file:
 
 - :oslo.config:option:`oslo_messaging_bmq.ssl_ca_file`
+- :oslo.config:option:`oslo_messaging_bmq.connect_timeout`
 - :oslo.config:option:`oslo_messaging_bmq.pool_domain`
 
 Logging

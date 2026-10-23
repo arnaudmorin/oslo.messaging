@@ -340,20 +340,25 @@ class BmqDriver(base.BaseDriver):
         conf.register_group(opt_group)
         conf.register_opts(bmq_options.BMQ_OPTS, group=opt_group)
         self._ssl_ca_file = conf.oslo_messaging_bmq.ssl_ca_file
+        self._connect_timeout = conf.oslo_messaging_bmq.connect_timeout
         # The fanout domain of the notification pools, if any
         self._pool_domain = conf.oslo_messaging_bmq.pool_domain or None
 
-        # Parse broker address (and credentials) from URL
-        self._credentials = None
-        if url.hosts:
-            host = url.hosts[0]
+        # Parse the brokers (and their credentials) from the URL: the
+        # sessions connect to the first one which accepts them, see
+        # _create_session()
+        self._brokers = []
+        for host in url.hosts:
             hostname = host.hostname or 'localhost'
             port = host.port or DEFAULT_PORT
-            self._broker = f"tcp://{hostname}:{port}"
+            credentials = None
             if host.username:
-                self._credentials = f"{host.username}:{host.password or ''}"
-        else:
-            self._broker = f"tcp://localhost:{DEFAULT_PORT}"
+                credentials = f"{host.username}:{host.password or ''}"
+            self._brokers.append((f"tcp://{hostname}:{port}", credentials))
+        if not self._brokers:
+            self._brokers.append((f"tcp://localhost:{DEFAULT_PORT}", None))
+        # The broker of the last session created
+        self._broker_index = 0
 
         # Domain from virtual_host
         if url.virtual_host:
@@ -429,41 +434,68 @@ class BmqDriver(base.BaseDriver):
                 self._uri_locks[uri] = threading.Lock()
             return self._uri_locks[uri]
 
-    def _security_kwargs(self):
+    @property
+    def _broker(self):
+        """The broker of the last session created."""
+        return self._brokers[self._broker_index][0]
+
+    def _security_kwargs(self, credentials):
         """Return the blazingmq.Session arguments for authentication and TLS.
 
         Only set what is configured, so a blazingmq SDK without
         authentication and TLS support still works when they are not used.
         """
         kwargs = {}
-        if self._credentials is not None:
-            credential = ('BASIC', self._credentials.encode())
+        if credentials is not None:
+            credential = ('BASIC', credentials.encode())
             kwargs['authn_credential_provider'] = lambda: credential
         if self._ssl_ca_file:
             kwargs['tls_certificate_authority'] = self._ssl_ca_file
         return kwargs
 
     def _create_session(self, on_message=None):
-        try:
-            session = blazingmq.Session(
-                self._on_session_event,
-                on_message=on_message,
-                broker=self._broker,
-                **self._security_kwargs(),
+        """Create a session with the first broker which accepts it.
+
+        The brokers of the transport URL are tried in turn, starting with
+        the broker of the last session, so both sessions of the driver use
+        the same broker. Once connected, the SDK reconnects the session to
+        the same broker.
+        """
+        errors = []
+        for i in range(len(self._brokers)):
+            index = (self._broker_index + i) % len(self._brokers)
+            broker, credentials = self._brokers[index]
+            try:
+                session = blazingmq.Session(
+                    self._on_session_event,
+                    on_message=on_message,
+                    broker=broker,
+                    timeout=blazingmq.Timeouts(
+                        connect_timeout=self._connect_timeout
+                    ),
+                    **self._security_kwargs(credentials),
+                )
+            except Exception as e:
+                # e.g. BrokerTimeoutError, when the broker is not reachable
+                # or refuses the credentials
+                errors.append(f"{broker}: {e}")
+                if len(self._brokers) > 1:
+                    LOG.warning(
+                        "Failed to connect to the BlazingMQ broker %s: %s",
+                        broker,
+                        e,
+                    )
+                continue
+            self._broker_index = index
+            LOG.info(
+                "BlazingMQ session created: broker=%s domain=%s",
+                broker,
+                self._domain,
             )
-        except Exception as e:
-            # e.g. BrokerTimeoutError, when the broker is not reachable or
-            # refuses the credentials
-            raise oslo_messaging.MessageDeliveryFailure(
-                f"Failed to connect to the BlazingMQ broker "
-                f"{self._broker}: {e}"
-            ) from e
-        LOG.info(
-            "BlazingMQ session created: broker=%s domain=%s",
-            self._broker,
-            self._domain,
+            return session
+        raise oslo_messaging.MessageDeliveryFailure(
+            "Failed to connect to the BlazingMQ broker " + ", ".join(errors)
         )
-        return session
 
     def _get_session(self):
         """Return the session of the listeners, creating it on first use.

@@ -75,7 +75,9 @@ class FakeAck:
 class FakeSession:
     """Minimal stand-in for blazingmq.Session."""
 
-    def __init__(self, on_session_event=None, on_message=None, broker=None):
+    def __init__(
+        self, on_session_event=None, on_message=None, broker=None, **kw
+    ):
         self._on_message = on_message
         self.opened = []  # (uri, read, write)
         self.closed = []
@@ -147,6 +149,19 @@ class TestTransportURL(BmqTestBase):
             'bmq.test.priority',
             'bmq.test.broadcast',
         )
+
+    def test_multiple_hosts(self):
+        driver = self._get_driver(
+            'bmq://u1:p1@host1:1111,u2:p2@host2/bmq.test.priority'
+        )
+        self.assertEqual(
+            [
+                ('tcp://host1:1111', 'u1:p1'),
+                ('tcp://host2:30114', 'u2:p2'),
+            ],
+            driver._brokers,
+        )
+        self.assertEqual('tcp://host1:1111', driver._broker)
 
     def test_invalid_pool_domain(self):
         self.config(pool_domain='bmq..fanout', group='oslo_messaging_bmq')
@@ -879,6 +894,32 @@ class TestSecurity(BmqTestBase):
             kwargs['authn_credential_provider'](),
         )
 
+    def test_credentials_of_each_host(self):
+        driver = self._get_driver(
+            'bmq://u1:p1@host1,u2:p2@host2/bmq.test.priority'
+        )
+        sessions = []
+
+        def session(on_session_event, broker=None, **kwargs):
+            if broker == 'tcp://host1:30114':
+                raise Exception('timeout')
+            sessions.append((broker, kwargs['authn_credential_provider']()))
+            return FakeSession()
+
+        with mock.patch.object(self.mock_bmq, 'Session', session):
+            driver._get_session()
+        self.assertEqual(
+            [('tcp://host2:30114', ('BASIC', b'u2:p2'))], sessions
+        )
+
+    def test_connect_timeout_from_config(self):
+        self.config(connect_timeout=5, group='oslo_messaging_bmq')
+        kwargs = self._session_kwargs('bmq://host:30114/bmq.test.priority')
+        self.mock_bmq.Timeouts.assert_called_with(connect_timeout=5.0)
+        self.assertEqual(
+            self.mock_bmq.Timeouts.return_value, kwargs['timeout']
+        )
+
     def test_tls_from_config(self):
         self.config(ssl_ca_file='/etc/bmq/ca.pem', group='oslo_messaging_bmq')
         kwargs = self._session_kwargs('bmq://host:30114/bmq.test.priority')
@@ -1119,6 +1160,43 @@ class TestErrors(BmqTestBase):
             oslo_messaging.Target(topic='compute', server='host1'),
             1,
             None,
+        )
+
+    def _session_of_brokers(self, down):
+        brokers = []
+
+        def session(on_session_event, on_message=None, broker=None, **kw):
+            brokers.append(broker)
+            if broker in down:
+                raise SdkError(f'{broker} timeout')
+            return FakeSession(on_session_event, on_message, broker)
+
+        self.mock_bmq.Session = session
+        return brokers
+
+    def test_next_host_on_connection_failure(self):
+        driver = self._get_driver('bmq://host1,host2/bmq.test.priority')
+        brokers = self._session_of_brokers({'tcp://host1:30114'})
+
+        driver._get_session()
+        driver._get_producer()
+
+        # the producer starts with the broker of the first session
+        self.assertEqual(
+            ['tcp://host1:30114', 'tcp://host2:30114', 'tcp://host2:30114'],
+            brokers,
+        )
+        self.assertEqual('tcp://host2:30114', driver._broker)
+
+    def test_all_hosts_down(self):
+        driver = self._get_driver('bmq://host1,host2/bmq.test.priority')
+        self._session_of_brokers({'tcp://host1:30114', 'tcp://host2:30114'})
+
+        self.assertRaisesRegex(
+            oslo_messaging.MessageDeliveryFailure,
+            'tcp://host1:30114: tcp://host1:30114 timeout, '
+            'tcp://host2:30114: tcp://host2:30114 timeout',
+            driver._get_session,
         )
 
     def test_open_queue_failure(self):

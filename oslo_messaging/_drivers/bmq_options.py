@@ -24,6 +24,14 @@ BMQ_OPTS = [
         'broker must listen with TLS. Requires a blazingmq SDK with TLS '
         'support.',
     ),
+    cfg.FloatOpt(
+        'connect_timeout',
+        default=60.0,
+        min=1.0,
+        help='Seconds to wait for a broker to accept a session. With '
+        'several hosts in the transport URL, a host which is down delays '
+        'the connection by this time before the next host is tried.',
+    ),
     cfg.StrOpt(
         'pool_domain',
         default='',
